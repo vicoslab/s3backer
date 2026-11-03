@@ -630,6 +630,12 @@ block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *const b
             i++;
             continue;
         case DIRTY:                             // includes a completed WRITING2 generation
+            // A rewrite during an in-flight write was requeued at the tail with a full delay; workers only
+            // inspect the head, so move it forward as above or it waits behind an older long-delay head.
+            if (entry != TAILQ_FIRST(&priv->dirties)) {
+                TAILQ_REMOVE(&priv->dirties, entry, link);
+                TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
+            }
             entry->timeout = block_cache_get_time(priv);
             pthread_cond_broadcast(&priv->worker_work);
             break;
