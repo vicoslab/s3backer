@@ -121,6 +121,7 @@
  */
 struct cache_entry {
     s3b_block_t                     block_num;      // block number - MUST BE FIRST
+    int                             write_error;    // last failed writeback, cleared on success
     u_int                           dirty:1;        // indicates state DIRTY or WRITING2
     u_int                           verify:1;       // data should be verified first
     uint32_t                        timeout:30;     // when to evict (CLEAN[2]) or write (DIRTY)
@@ -152,6 +153,14 @@ struct cache_entry {
 // Declare the list "head" struct
 TAILQ_HEAD(list_head, cache_entry);
 
+// Active flushes are registered only while holding the cache mutex.
+struct block_cache_flush_waiter {
+    struct block_cache_flush_waiter *next;
+    const s3b_block_t *blocks;
+    u_int num_blocks;
+    int error;
+};
+
 // Private data
 struct block_cache_private {
     struct block_cache_conf         *config;        // configuration
@@ -174,6 +183,7 @@ struct block_cache_private {
     u_int                           thread_id;      // next thread id
     u_int                           num_threads;    // number of alive worker threads
     pthread_t                       *threads;       // worker threads
+    struct block_cache_flush_waiter *flush_waiters; // active flush error recipients
     int                             stopping;       // signals worker threads to exit
     block_list_func_t               *survey_callback;// non-zero survey is running and this is the callback
     void                            *survey_arg;    // non-zero survey is running and this is the arg
@@ -196,7 +206,7 @@ static int block_cache_write_block(struct s3backer_store *s3b, s3b_block_t block
 static int block_cache_read_block_part(struct s3backer_store *s3b, s3b_block_t block_num, u_int off, u_int len, void *dest);
 static int block_cache_write_block_part(struct s3backer_store *s3b, s3b_block_t block_num, u_int off, u_int len, const void *src);
 static int block_cache_flush_blocks(struct s3backer_store *s3b, const s3b_block_t *block_nums, u_int num_blocks, long timeout);
-static int block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *block_nums, u_int num_blocks, long timeout);
+static int block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *block_nums, u_int num_blocks, long timeout, int flush_all);
 static int block_cache_survey_non_zero(struct s3backer_store *s3b, block_list_func_t *callback, void *arg);
 static int block_cache_shutdown(struct s3backer_store *s3b);
 static void block_cache_destroy(struct s3backer_store *s3b);
@@ -204,6 +214,7 @@ static void block_cache_destroy(struct s3backer_store *s3b);
 // Other functions
 static s3b_dcache_visit_t block_cache_dcache_load;
 static s3b_hash_visit_t block_cache_append_block_list;
+static void block_cache_write_failed(struct block_cache_private *priv, struct cache_entry *entry, int error);
 static int block_cache_read(struct block_cache_private *priv, s3b_block_t block_num, u_int off, u_int len, void *dest);
 static int block_cache_do_read(struct block_cache_private *priv, s3b_block_t block_num, u_int off, u_int len, void *dest, int stats);
 static int block_cache_write(struct block_cache_private *priv, s3b_block_t block_num, u_int off, u_int len, const void *src);
@@ -472,32 +483,29 @@ block_cache_flush_blocks(struct s3backer_store *s3b, const s3b_block_t *block_nu
 {
     struct block_cache_private *const priv = s3b->data;
     struct block_list block_list;
-    struct cache_entry *entry;
+    const int flush_all = block_nums == NULL;
     int r = 0;
 
     // Initialize block list
     block_list_init(&block_list);
 
+    pthread_mutex_lock(&priv->mutex);
+    S3BCACHE_CHECK_INVARIANTS(priv, 0);
+
     // If "block_nums" is NULL that means we should flush all dirty blocks
     if (block_nums == NULL) {
 
-        // Grab lock and sanity check
-        pthread_mutex_lock(&priv->mutex);
-        S3BCACHE_CHECK_INVARIANTS(priv, 0);
+        // WRITING/WRITING2 entries are absent from the dirty queue. Snapshot the
+        // bounded cache instead; the state-aware wait below skips clean entries.
+        r = s3b_hash_foreach(priv->hashtable, block_cache_append_block_list, &block_list);
 
-        // Add all DIRTYs to the block list
-        for (entry = TAILQ_FIRST(&priv->dirties); entry != NULL; entry = TAILQ_NEXT(entry, link)) {
-            assert(ENTRY_GET_STATE(entry) == DIRTY);
-            if ((r = block_list_append(&block_list, entry->block_num)) != 0)
-                break;
-        }
-
-        // Release lock
-        CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
-
-        // If we got an error, or the list is empty, bail out
-        if (r != 0 || block_list.num_blocks == 0)
+        if (r != 0 || block_list.num_blocks == 0) {
+            CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+            if (r != 0)
+                goto done;
+            r = (*priv->inner->flush_blocks)(priv->inner, NULL, 0, timeout);
             goto done;
+        }
 
         // Now use the list we built
         block_nums = block_list.blocks;
@@ -505,7 +513,7 @@ block_cache_flush_blocks(struct s3backer_store *s3b, const s3b_block_t *block_nu
     }
 
     // Proceed
-    r = block_cache_flush_blocks2(s3b, block_nums, num_blocks, timeout);
+    r = block_cache_flush_blocks2(s3b, block_nums, num_blocks, timeout, flush_all);
 
 done:
     // Done
@@ -514,12 +522,14 @@ done:
 }
 
 static int
-block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *const block_nums, const u_int num_blocks, long timeout)
+block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *const block_nums, const u_int num_blocks, long timeout, int flush_all)
 {
     struct block_cache_private *const priv = s3b->data;
     const uint32_t now = block_cache_get_time(priv);
     struct cache_entry *entry;
     uint64_t absolute_timeout;
+    struct block_cache_flush_waiter waiter = { .blocks = block_nums, .num_blocks = num_blocks };
+    struct block_cache_flush_waiter **wp;
     int need_signal = 0;
     int r = 0;
     u_int i;
@@ -530,9 +540,17 @@ block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *const b
     // Calculate absolute timeout
     absolute_timeout = timeout > 0 ? block_cache_get_time_millis() + timeout : 0;
 
-    // Grab lock and sanity check
-    pthread_mutex_lock(&priv->mutex);
+    // Caller holds the mutex continuously from the flush-all snapshot.
     S3BCACHE_CHECK_INVARIANTS(priv, 0);
+
+    waiter.next = priv->flush_waiters;
+    priv->flush_waiters = &waiter;
+    for (i = 0; i < num_blocks; i++) {
+        if ((entry = s3b_hash_get(priv->hashtable, block_nums[i])) != NULL && entry->write_error != 0) {
+            waiter.error = entry->write_error;
+            break;
+        }
+    }
 
     // Move all DIRTY blocks to the front of the queue (in the order given to us) so they will be written first
     for (i = num_blocks; i > 0; i--) {
@@ -558,7 +576,7 @@ block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *const b
         pthread_cond_broadcast(&priv->worker_work);
 
     // Wait for each block in our list to become clean
-    for (i = 0; i < num_blocks; ) {
+    for (i = 0; i < num_blocks && waiter.error == 0; ) {
         const s3b_block_t block_num = block_nums[i];
 
         // Check for stopping condition; this shouldn't ever happen but if it does we don't want to hang
@@ -581,7 +599,9 @@ block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *const b
         case READING2:                          // this block is clean - advance to the next block
             i++;
             continue;
-        case DIRTY:                             // this block is waiting for a worker thread to get to it
+        case DIRTY:                             // includes a completed WRITING2 generation
+            entry->timeout = block_cache_get_time(priv);
+            pthread_cond_broadcast(&priv->worker_work);
             break;
         case WRITING:
         case WRITING2:                          // a worker thread is currently writing out this block
@@ -599,6 +619,12 @@ block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *const b
             pthread_cond_wait(&priv->write_complete, &priv->mutex);
     }
 
+    if (waiter.error != 0)
+        r = waiter.error;
+    for (wp = &priv->flush_waiters; *wp != &waiter; wp = &(*wp)->next)
+        ;
+    *wp = waiter.next;
+
     // Release lock
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
 
@@ -610,7 +636,7 @@ block_cache_flush_blocks2(struct s3backer_store *s3b, const s3b_block_t *const b
             if ((timeout = absolute_timeout - block_cache_get_time_millis()) <= 0)
                 timeout = 1;
         }
-        r = (*priv->inner->flush_blocks)(priv->inner, block_nums, num_blocks, timeout);
+        r = (*priv->inner->flush_blocks)(priv->inner, flush_all ? NULL : block_nums, flush_all ? 0 : num_blocks, timeout);
     }
 
     // Done
@@ -1224,6 +1250,23 @@ fail:
     return r;
 }
 
+/* Record errors before any retry can hide them from an active flush. Mutex held. */
+static void
+block_cache_write_failed(struct block_cache_private *priv, struct cache_entry *entry, int error)
+{
+    struct block_cache_flush_waiter *w;
+    u_int i;
+
+    entry->write_error = error;
+    for (w = priv->flush_waiters; w != NULL; w = w->next) {
+        for (i = 0; i < w->num_blocks; i++) {
+            if (w->blocks[i] == entry->block_num && w->error == 0)
+                w->error = error;
+        }
+    }
+    pthread_cond_broadcast(&priv->write_complete);
+}
+
 /*
  * Acquire a new cache entry. If the cache is full, and there is at least one
  * CLEAN[2] entry, evict and return it (uninitialized). Otherwise, return NULL entry.
@@ -1402,7 +1445,9 @@ block_cache_worker_main(void *arg)
             // Copy data to our private buffer; it may change while we're writing
             if ((r = block_cache_read_data(priv, entry, buf, 0, config->block_size)) != 0) {
                 (*config->log)(LOG_ERR, "error reading cached block! %s", strerror(r));
-                sleep(5);
+                block_cache_write_failed(priv, entry, r);
+                entry->timeout = block_cache_get_time(priv) + (priv->dirty_timeout ? priv->dirty_timeout : 1);
+                block_cache_worker_wait(priv, entry);
                 continue;
             }
 
@@ -1425,10 +1470,16 @@ block_cache_worker_main(void *arg)
 
             // If write attempt failed (or we canceled it), go back to the DIRTY state and try again later
             if (r != 0) {
+                const int canceled = r == ECONNABORTED && entry->dirty;
                 entry->dirty = 1;
                 TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
+                if (!canceled)
+                    block_cache_write_failed(priv, entry, r);
+                pthread_cond_broadcast(&priv->write_complete);
                 continue;
             }
+
+            entry->write_error = 0;
 
             // If block was not modified while being written (WRITING), it is now CLEAN
             if (!entry->dirty) {
@@ -1451,6 +1502,7 @@ block_cache_worker_main(void *arg)
             // Block was modified while being written (WRITING2), so it stays DIRTY
             TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
             entry->timeout = now + priv->dirty_timeout;     // update for 2nd write timing conservatively
+            pthread_cond_broadcast(&priv->write_complete);
             continue;
         }
 
