@@ -15,7 +15,7 @@ REPO = HERE.parent.parent
 BASE = HERE / 'baseline'
 SOURCES = 'nbdkit block_cache block_part dcache ec_protect zero_cache erase fuse_ops hash util compress http_io reset s3b_config test_io sslcompat gitrev'.split()
 WRAPS = ['fsync', 'fdatasync', 'pread', 'pwrite', 'pthread_cond_wait', 'pthread_cond_timedwait', 'pthread_rwlock_rdlock', 'pthread_rwlock_wrlock']
-ML_CASES = ['ml-dirty-read-same', 'ml-dirty-read-diff', 'ml-write-overlap-dirty', 'ml-write-overlap-clean', 'ml-same-block-excl', 'ml-reader-vs-write',
+ML_CASES = ['ml-writer-observation-gap', 'ml-dirty-read-same', 'ml-dirty-read-diff', 'ml-write-overlap-dirty', 'ml-write-overlap-clean', 'ml-same-block-excl', 'ml-reader-vs-write',
             'ml-writer-progress', 'ml-snapshot', 'ml-flush-pending-write', 'ml-shutdown-pending-write', 'ml-upload-rewrite', 'ml-singleflight',
             'ml-fill-error', 'ml-readahead', 'ml-evict-gate', 'ml-full-dirty', 'ml-clean2-shared', 'ml-pwrite-error', 'ml-snapshot-error', 'ml-restart',
             'ml-slot-reuse', 'ml-dcache-extend', 'ml-late-write-hit', 'ml-late-write-miss', 'ml-read-owner', 'ml-after-shutdown']
@@ -129,7 +129,7 @@ def main():
             if only and case not in only: return
             jobs.append((b / binary, case, label, use_disk))
         if 'local' in suites:
-            for c in ['lf-local', 'lf-default', 'lf-sync-error', 'lf-pwrite-error', 'lf-drain', 'lf-pending', 'lf-signal', 'lf-drain-error', 'lf-shutdown-error', 'lf-pressure', 'lf-metadata-error', 'lf-create-error', 'lf-invalid', 'lf-crash', 'lf-identity-tears', 'lf-marker-error', 'lf-header-error', 'lf-clean2-write', 'lf-sync-concurrent', 'lf-reopen-gates', 'lf-erase-order', 'lf-generation', 'lf-shutdown-pending', 'lf-stress', 'lf-read-miss-error', 'lf-erase-error', 'lf-clean-migration', 'lf-maxdirty', 'lf-slot-reuse', 'lf-helper']:
+            for c in ['lf-read-verify-tears', 'lf-read-refill-tears', 'lf-alloc-terminal', 'lf-read-fill-tears', 'lf-remote-read-errors', 'lf-shutdown-snapshot-error', 'lf-shutdown-snapshot-short', 'lf-poison-during-sync', 'lf-poison-space-waiter', 'lf-local', 'lf-default', 'lf-sync-error', 'lf-pwrite-error', 'lf-drain', 'lf-pending', 'lf-signal', 'lf-drain-error', 'lf-shutdown-error', 'lf-pressure', 'lf-metadata-error', 'lf-create-error', 'lf-invalid', 'lf-crash', 'lf-identity-tears', 'lf-marker-error', 'lf-header-error', 'lf-clean2-write', 'lf-sync-concurrent', 'lf-reopen-gates', 'lf-erase-order', 'lf-generation', 'lf-shutdown-pending', 'lf-stress', 'lf-read-miss-error', 'lf-erase-error', 'lf-clean-migration', 'lf-maxdirty', 'lf-slot-reuse', 'lf-helper']:
                 add('ml-test', c, f'local/disk/{c}', True)
         if 'ml' in suites:
             for c in ML_CASES:

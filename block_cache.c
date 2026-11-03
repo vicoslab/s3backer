@@ -1145,6 +1145,7 @@ block_cache_do_read(struct block_cache_private *const priv, s3b_block_t block_nu
     int verified_but_not_read = 0;
     int erase_first = 0;
     int was_verify = 0;
+    int slot_safe = 0;              // directory is durably empty and payload untouched by this fill
     int direct = 0;
     void *data = NULL;
     int r;
@@ -1155,6 +1156,7 @@ block_cache_do_read(struct block_cache_private *const priv, s3b_block_t block_nu
     assert(off + len <= priv->config->block_size);
 
 again:
+    if (config->local_flush && (r = s3b_dcache_error(priv->dcache)) != 0) return r;
     direct = 0;
     // Check to see if a cache entry already exists
     if ((entry = s3b_hash_get(priv->hashtable, block_num)) != NULL) {
@@ -1257,6 +1259,7 @@ again:
         block_cache_wait_space(priv);
         goto again;
     }
+    slot_safe = 1;
     entry->block_num = block_num;
     entry->dirty = 0;
     entry->verify = 0;
@@ -1285,6 +1288,7 @@ read:
         if ((r = s3b_dcache_erase_block(priv->dcache, entry->u.dslot)) != 0)
             (*config->log)(LOG_ERR, "can't erase cached block! %s", strerror(r));
         if (r && config->local_flush) goto fail;
+        slot_safe = r == 0;
     }
     r = (*priv->inner->read_block)(priv->inner, block_num, data, etag, was_verify ? entry->etag : NULL, 0);
 
@@ -1305,6 +1309,7 @@ read:
     // Copy data into the disk cache and free temporary buffer (if necessary)
     if (config->cache_file != NULL) {
         if (!verified_but_not_read) {
+            slot_safe = 0;             // any local payload failure is uncertain; quarantine
             if ((r = s3b_dcache_write_block(priv->dcache, entry->u.dslot, data, 0, config->block_size)) != 0)
                 goto fail;
         }
@@ -1312,10 +1317,12 @@ read:
         data = NULL;
     }
 
-    // Record the clean block (a failure is only logged: the block is still valid in this run)
+    // Local mode must persist the CLEAN identity before publishing it for a future DIRTY marker.
     if (config->cache_file != NULL) {
+        slot_safe = 0;
         if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, etag)) != 0)
             (*config->log)(LOG_ERR, "can't record cached block! %s", strerror(r));
+        if (!r && config->local_flush) r = s3b_dcache_fsync(priv->dcache);
     }
     if (r && config->local_flush) goto fail;
     pthread_mutex_lock(&priv->mutex);
@@ -1360,13 +1367,19 @@ fail:
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 1);
     assert(ENTRY_GET_STATE(entry) == READING || ENTRY_GET_STATE(entry) == READING2);
-    if (config->cache_file != NULL && !config->local_flush)
-        s3b_dcache_free_block(priv->dcache, entry->u.dslot);
+    if (config->cache_file != NULL && (!config->local_flush || slot_safe)) {
+        int free_error = s3b_dcache_free_block(priv->dcache, entry->u.dslot);
+        if (free_error && config->local_flush) r = s3b_dcache_poison(priv->dcache, free_error);
+    }
     s3b_hash_remove(priv->hashtable, entry->block_num);
     free(data);
     block_cache_entry_free(entry);
     pthread_cond_broadcast(&priv->end_reading);     // waiters retry; one of them becomes the next owner
     pthread_cond_broadcast(&priv->space_avail);
+    if (config->local_flush && s3b_dcache_error(priv->dcache)) {
+        pthread_cond_broadcast(&priv->write_complete);
+        pthread_cond_broadcast(&priv->worker_work);
+    }
     return r;
 }
 
@@ -1680,6 +1693,11 @@ block_cache_write_failed(struct block_cache_private *priv, struct cache_entry *e
     u_int i;
 
     entry->write_error = error;
+    if (priv->config->local_flush && s3b_dcache_error(priv->dcache)) {
+        pthread_cond_broadcast(&priv->space_avail);
+        pthread_cond_broadcast(&priv->end_reading);
+        pthread_cond_broadcast(&priv->worker_work);
+    }
     for (w = priv->flush_waiters; w != NULL; w = w->next) {
         for (i = 0; i < w->num_blocks; i++) {
             if (w->blocks[i] == entry->block_num && w->error == 0)
@@ -1711,6 +1729,7 @@ block_cache_get_entry(struct block_cache_private *priv, struct cache_entry **ent
     int r;
 
 again:
+    if (config->local_flush && (r = s3b_dcache_error(priv->dcache)) != 0) return r;
     /*
      * If cache is not full, allocate a new entry. We allocate the structure
      * and the data separately in hopes that the malloc() implementation will
@@ -1755,6 +1774,7 @@ again:
         data = NULL;
         block_cache_entry_free(entry);
         entry = NULL;
+        if (config->local_flush) return s3b_dcache_poison(priv->dcache, r);
         goto done;
     }
 
@@ -1914,7 +1934,7 @@ block_cache_worker_main(void *arg)
                 entry->timeout = config->local_flush ? READING_TIMEOUT : block_cache_get_time(priv) + (priv->dirty_timeout ? priv->dirty_timeout : 1);
                 pthread_rwlock_unlock(&entry->lock);
                 block_cache_entry_unref(priv, entry, 1);
-                block_cache_worker_wait(priv, entry);
+                if (!config->local_flush) block_cache_worker_wait(priv, entry);
                 continue;
             }
 
@@ -2255,6 +2275,12 @@ static void
 block_cache_op_done(struct block_cache_private *priv)
 {
     assert(priv->active_ops > 0);
+    if (priv->config->local_flush && s3b_dcache_error(priv->dcache)) {
+        pthread_cond_broadcast(&priv->space_avail);
+        pthread_cond_broadcast(&priv->end_reading);
+        pthread_cond_broadcast(&priv->write_complete);
+        pthread_cond_broadcast(&priv->worker_work);
+    }
     if (--priv->active_ops == 0 && priv->unpin_waiters > 0)
         pthread_cond_broadcast(&priv->unpinned);
 }

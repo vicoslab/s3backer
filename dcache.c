@@ -1010,8 +1010,10 @@ s3b_dcache_fsync(struct s3b_dcache *priv)
         r = s3b_dcache_error(priv);
         if (r == 0 && fdatasync(priv->fd) == -1) {
             r = errno;
-            __atomic_store_n(&priv->sync_error, r, __ATOMIC_RELEASE);
+            r = s3b_dcache_poison(priv, r);
         }
+        // A payload/read error may publish while the slow sync is in progress.
+        r = s3b_dcache_error(priv);
         pthread_mutex_unlock(&priv->sync_mutex);
         return r;
     }
@@ -1030,11 +1032,10 @@ int s3b_dcache_error(struct s3b_dcache *priv) {
 }
 int s3b_dcache_poison(struct s3b_dcache *priv, int error) {
     if (!priv->local_flush || !error) return error;
-    pthread_mutex_lock(&priv->sync_mutex);
-    if (!s3b_dcache_error(priv)) __atomic_store_n(&priv->sync_error, error, __ATOMIC_RELEASE);
-    error = s3b_dcache_error(priv);
-    pthread_mutex_unlock(&priv->sync_mutex);
-    return error;
+    int expected = 0;
+    // Publish the first observed error without waiting for a concurrent slow sync.
+    __atomic_compare_exchange_n(&priv->sync_error, &expected, error, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    return s3b_dcache_error(priv);
 }
 int s3b_dcache_local_ack(struct s3b_dcache *priv) { return !!(priv->flags & HDRFLG_LOCAL_ACK); }
 int s3b_dcache_clear_local_ack(struct s3b_dcache *priv) {

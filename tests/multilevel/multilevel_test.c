@@ -17,24 +17,31 @@ void *test_memcpy(void *dst, const void *src, size_t n);
 
 #define REQUIRE(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
 #define BS 4096
-#define NB 16
+#define NB 32
 #define WAIT_MS 5000
 
 enum { NONE, VIA_PREAD, VIA_MEMCPY, VIA_PWRITE };
 struct gate { int kind, hold, inject; size_t len; u_int off; int armed, entered, released, held; };
 struct watch { int waits; void *last; };
-enum { OP_READ, OP_WRITE, OP_FLUSH, OP_SHUTDOWN, OP_DRAIN };
+enum { OP_READ, OP_WRITE, OP_FLUSH, OP_SHUTDOWN, OP_DRAIN, OP_INTERNAL_SYNC };
 struct op { int kind, b, gen, watched, r, done; u_int off, len; struct gate g; struct watch w; unsigned char buf[BS]; pthread_t t; };
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static __thread struct gate *tl_gate;
 static __thread struct watch *tl_watch;
+static __thread int tl_sync_allowed;
 static __thread int tl_test;                    // created by this test, not a cache worker
 static atomic_uint worker_waits;
 static int disk;
 static int local_mode;
 static u_int local_max_dirty;
+static int local_threads = 2;
+static atomic_int remote_read_fail;
+static int sync_hold, sync_entered, sync_release, capture_sync;
+static unsigned char durable_image[262144];
+static size_t durable_len;
+static int writer_hold, writer_entered, writer_release;
 static atomic_int sync_fail;
 static atomic_uint sync_calls;
 static atomic_int erase_observer, synced_marker;
@@ -51,7 +58,11 @@ extern int __real_fdatasync(int);
 int __wrap_fdatasync(int fd) {
     atomic_fetch_add(&sync_calls, 1);
     if (atomic_exchange(&sync_fail, 0)) { errno = EIO; return -1; }
+    pthread_mutex_lock(&g_mu);
+    if (sync_hold && tl_sync_allowed) { sync_entered = 1; pthread_cond_broadcast(&g_cv); while (!sync_release) pthread_cond_wait(&g_cv,&g_mu); }
+    pthread_mutex_unlock(&g_mu);
     int r = __real_fdatasync(fd);
+    if (!r && capture_sync) { struct stat st; REQUIRE(fstat(fd,&st)==0 && st.st_size <= sizeof(durable_image)); durable_len=st.st_size; REQUIRE(pread(fd,durable_image,durable_len,0)==durable_len); }
     if (!r && atomic_load(&erase_observer)) { uint32_t flags; REQUIRE(pread(fd,&flags,4,84)==4); atomic_store(&synced_marker,flags); }
     return r;
 }
@@ -168,7 +179,14 @@ static void observe_lock(void *l) {
 extern int __real_pthread_rwlock_rdlock(pthread_rwlock_t *);
 extern int __real_pthread_rwlock_wrlock(pthread_rwlock_t *);
 int __wrap_pthread_rwlock_rdlock(pthread_rwlock_t *l) { if (pthread_rwlock_tryrdlock(l) == 0) return 0; observe_lock(l); return __real_pthread_rwlock_rdlock(l); }
-int __wrap_pthread_rwlock_wrlock(pthread_rwlock_t *l) { if (pthread_rwlock_trywrlock(l) == 0) return 0; observe_lock(l); return __real_pthread_rwlock_wrlock(l); }
+int __wrap_pthread_rwlock_wrlock(pthread_rwlock_t *l) {
+    if (pthread_rwlock_trywrlock(l) == 0) return 0;
+    observe_lock(l);
+    pthread_mutex_lock(&g_mu);
+    if (writer_hold && tl_test) { writer_entered=1; pthread_cond_broadcast(&g_cv); while(!writer_release) pthread_cond_wait(&g_cv,&g_mu); }
+    pthread_mutex_unlock(&g_mu);
+    return __real_pthread_rwlock_wrlock(l);
+}
 static void observe(pthread_cond_t *c, pthread_mutex_t *m) {
     if (m == &g_mu) return;
     if (tl_watch) { pthread_mutex_lock(&g_mu); tl_watch->waits++; tl_watch->last = c; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu); }
@@ -185,6 +203,7 @@ static int be_token(struct s3backer_store *s, int32_t *old, int32_t value) { (vo
 static int be_flush(struct s3backer_store *s, const s3b_block_t *b, u_int n, long t) { (void)s; (void)b; (void)n; (void)t; return 0; }
 static int be_read(struct s3backer_store *s, s3b_block_t b, void *dst, u_char *tag, const u_char *expect, int strict) {
     u_char t[MD5_DIGEST_LENGTH]; (void)s; (void)strict;
+    if (atomic_load(&remote_read_fail)) return EIO;
     pthread_mutex_lock(&g_mu);
     if ((int)b == rgate_block) {
         const int call = ++rgate_entered; pthread_cond_broadcast(&g_cv);
@@ -219,7 +238,7 @@ static void watchdog(int sig) { (void)sig; static const char msg[] = "FAIL watch
 // Cache lifecycle and inspection (inspection always takes the cache mutex)
 static void open_cache2(u_int size, u_int timeout_ms, u_int protect, u_int delay, u_int ra) {
     memset(&cc, 0, sizeof(cc));
-    cc.block_size = BS; cc.cache_size = size; cc.num_threads = 2; cc.timeout = timeout_ms; cc.num_protected = protect;
+    cc.block_size = BS; cc.cache_size = size; cc.num_threads = local_threads; cc.timeout = timeout_ms; cc.num_protected = protect;
     cc.max_dirty = local_max_dirty;
     cc.write_delay = delay; cc.read_ahead = ra; cc.read_ahead_trigger = ra ? 2 : 0;
     #ifdef ML_HAS_LOCAL_FLUSH
@@ -255,10 +274,12 @@ static int total_breads(void) { int n = 0; pthread_mutex_lock(&g_mu); for (int b
 // Operations on test threads
 static void *op_main(void *arg) {
     struct op *o = arg; int r = 0;
+    tl_sync_allowed = o->kind==OP_WRITE || o->kind==OP_INTERNAL_SYNC;
     tl_test = 1; tl_gate = o->g.kind ? &o->g : NULL; tl_watch = o->watched ? &o->w : NULL;
     switch (o->kind) {
     case OP_READ: r = o->len == BS ? cache->read_block(cache, o->b, o->buf, NULL, NULL, 0) : cache->read_block_part(cache, o->b, o->off, o->len, o->buf); break;
     case OP_WRITE: fill(o->buf, o->b, o->gen); r = cache->write_block(cache, o->b, o->buf, NULL, NULL, NULL); break;
+    case OP_INTERNAL_SYNC: r = s3b_dcache_fsync(P->dcache); break;
     case OP_FLUSH: r = cache->flush_blocks(cache, NULL, 0, 0); break;
     case OP_DRAIN:
 #ifdef ML_HAS_LOCAL_FLUSH
@@ -649,6 +670,10 @@ static void case_ml_reader_vs_write(void) {
 #ifdef MULTILEVEL_CANDIDATE
     require_pins(0, 1, 1, 1);                                   // one shared reference (A), one exclusive (W)
 #endif
+    pthread_mutex_lock(&P->mutex); struct cache_entry *locked_entry=s3b_hash_get(P->hashtable,0); pthread_mutex_unlock(&P->mutex);
+    int queued=0;
+    for(int i=0;i<WAIT_MS;i++) { int q=pthread_rwlock_tryrdlock(&locked_entry->lock); if(q==EBUSY) { queued=1; break; } REQUIRE(q==0); pthread_rwlock_unlock(&locked_entry->lock); nap(1); }
+    REQUIRE(queued); printf("observed native queued writer: libc tryrdlock=EBUSY while initial reader held\n");
     start(c);
     printf("observed reader-vs-write: later_reader_entered_while_writer_waits=%d\n", AWAIT(c->g.entered, SHORT_NEG_MS));
     REQUIRE(!GET(c->g.entered)); REQUIRE(!GET(c->done));
@@ -1260,8 +1285,107 @@ static void case_lf_helper(void) {
 #endif
 }
 
+
+// This deliberately holds the writer AFTER the old wait counter, BEFORE libc's blocking call.
+static void case_ml_writer_observation_gap(void) {
+    open_x(8); warm(0);
+    struct op *a=reader(0,0,BS,1,1), *w=writer(0,777,0,0), *c=reader(0,512,1024,1,0);
+    start(a); REQUIRE(AWAIT(a->g.entered,WAIT_MS)); writer_hold=1;
+    start(w); REQUIRE(AWAIT(writer_entered,WAIT_MS)); REQUIRE(GET(w->w.waits)>0);
+    start(c); finish(c); REQUIRE(c->g.entered && got(c)==cached[0]);
+    printf("observed old wait counter before native queue: later reader overtakes gated writer\n");
+    pthread_mutex_lock(&g_mu); writer_release=1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    release(a); finish(a); finish(w); REQUIRE(w->r==0); free(a); free(w); free(c);
+}
+static void case_lf_remote_read_errors(void) {
+    local_mode=1; open_cache(2,0,0); atomic_store(&remote_read_fail,1);
+    for(int i=0;i<7;i++) { struct op *r=reader(3,0,BS,0,0); start(r); finish(r); REQUIRE(r->r==EIO && !has_block(3)); free(r); }
+    REQUIRE(s3b_dcache_size(P->dcache)==0); atomic_store(&remote_read_fail,0);
+    warm(3); close_cache(); open_cache(2,0,0); REQUIRE(state_of(3)==CLEAN2);
+    atomic_store(&remote_read_fail,1); struct op *r=reader(3,0,BS,0,0); start(r); finish(r); REQUIRE(r->r==EIO); free(r);
+    REQUIRE(s3b_dcache_size(P->dcache)==0); atomic_store(&remote_read_fail,0);
+    warm(3); write_sync(4,777); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==0); close_cache();
+}
+static void case_lf_shutdown_snapshot_error(void) {
+    local_threads=1; lf_open(); write_sync(3,777); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==0);
+    wsnap=(struct gate){.kind=VIA_PREAD,.len=BS,.armed=1,.inject=EIO};
+    struct op *s=op_new(OP_SHUTDOWN,0); start(s); finish(s); REQUIRE(s->r==EIO); REQUIRE(state_of(3)==DIRTY);
+    int fd=open(cc.cache_file,O_RDONLY); uint32_t flags,marker; REQUIRE(fd>=0);
+    REQUIRE(pread(fd,&flags,4,24)==4 && (flags&2)); REQUIRE(pread(fd,&marker,4,84)==4 && marker==1); close(fd);
+    cache->destroy(cache); cache=NULL; free(s);
+}
+static void case_lf_shutdown_snapshot_short(void) {
+    local_threads=1; lf_open(); write_sync(3,777); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==0);
+    int fd=open(cc.cache_file,O_RDWR); REQUIRE(fd>=0 && ftruncate(fd,4096)==0); close(fd);
+    struct op *s=op_new(OP_SHUTDOWN,0); start(s); finish(s); REQUIRE(s->r!=0 && state_of(3)==DIRTY);
+    fd=open(cc.cache_file,O_RDONLY); uint32_t flags,marker; REQUIRE(fd>=0);
+    REQUIRE(pread(fd,&flags,4,24)==4 && (flags&2)); REQUIRE(pread(fd,&marker,4,84)==4 && marker==1); close(fd);
+    cache->destroy(cache); cache=NULL; free(s);
+}
+static void case_lf_poison_during_sync(void) {
+    lf_open(); write_sync(3,777);
+    sync_hold=1; struct op *f=op_new(OP_INTERNAL_SYNC,0); start(f); REQUIRE(AWAIT(sync_entered,WAIT_MS));
+    struct op *w=writer(3,778,1,0); w->g.inject=EIO; start(w); REQUIRE(AWAIT(w->g.entered,WAIT_MS));
+    // The I/O error must publish without waiting for slow sync, and the pending sync must see it.
+    REQUIRE(AWAIT(w->done,1000)); REQUIRE(s3b_dcache_error(P->dcache)==EIO);
+    pthread_mutex_lock(&g_mu); sync_release=1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    finish(w); finish(f); REQUIRE(w->r==EIO && f->r==EIO); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==EIO); _exit(0);
+}
+static void case_lf_poison_space_waiter(void) {
+    local_mode=1; open_cache(2,0,0); wgate_open(0); write_sync(0,777);
+    struct op *d=op_new(OP_DRAIN,0); start(d); REQUIRE(AWAIT(wgate_entered>=1,WAIT_MS));
+    write_sync(1,778);
+    struct op *r=reader(2,0,BS,0,0); r->watched=1; start(r); REQUIRE(AWAIT(r->w.last==&P->space_avail,WAIT_MS));
+    struct op *w=writer(1,779,1,0); w->g.inject=EIO; start(w); finish(w); REQUIRE(w->r==EIO);
+    finish(r); REQUIRE(r->r==EIO); REQUIRE(has_block(0) && has_block(1) && !has_block(2));
+    REQUIRE(s3b_dcache_size(P->dcache)==2); wgate_release(); finish(d); REQUIRE(d->r==EIO); _exit(0);
+}
+static int fill_tear_foreign;
+static int fill_tear_visit(void *arg,s3b_block_t slot,s3b_block_t block,const u_char *tag) {
+    (void)arg; if(!tag && (slot!=18 || block!=25)) fill_tear_foreign++; return 0;
+}
+static void read_fill_tears(int verify) {
+    local_mode=1; open_cache(32,0,0); capture_sync=1;
+    for(int b=0;b<18;b++) warm(b); warm(25);
+    if (verify) { capture_sync=0; close_cache(); open_cache(32,0,0); REQUIRE(state_of(25)==CLEAN2);
+        if(verify==2) { pthread_mutex_lock(&g_mu); bgen[25]++; pthread_mutex_unlock(&g_mu); }
+        capture_sync=1; REQUIRE(read_sync(25,0,BS)==GET(bgen[25])); }
+    capture_sync=0;
+    pthread_mutex_lock(&P->mutex); struct cache_entry *e=s3b_hash_get(P->hashtable,25); REQUIRE(e && e->u.dslot==18); pthread_mutex_unlock(&P->mutex);
+    sync_hold=1; struct op *w=writer(25,999,0,0); start(w); REQUIRE(AWAIT(sync_entered,WAIT_MS));
+    unsigned char actual[24]; int fd=open(cc.cache_file,O_RDONLY); REQUIRE(fd>=0 && pread(fd,actual,24,496)==24); close(fd);
+    uint32_t block,flags; memcpy(&block,actual,4); memcpy(&flags,actual+20,4); REQUIRE(block==25 && flags==1);
+    char path[4096]; REQUIRE(snprintf(path,sizeof(path),"%s.tear",cc.cache_file)<sizeof(path));
+    struct block_cache_conf c=cc; c.cache_file=path;
+    // Actual issued marker/record bytes, persisted after a 512-byte sector boundary, with each tail prefix.
+    for(int n=0;n<=8;n++) {
+        fd=open(path,O_CREAT|O_TRUNC|O_RDWR,0600); REQUIRE(fd>=0);
+        REQUIRE(write(fd,durable_image,durable_len)==durable_len); REQUIRE(pwrite(fd,actual+16,n,512)==n); close(fd);
+        struct s3b_dcache *d; fill_tear_foreign=0; REQUIRE(s3b_dcache_open(&d,&c,fill_tear_visit,NULL,1)==0);
+        REQUIRE(fill_tear_foreign==0); s3b_dcache_close(d);
+    }
+    unlink(path); pthread_mutex_lock(&g_mu); sync_release=1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    finish(w); REQUIRE(w->r==0); free(w);
+}
+
+static void case_lf_read_fill_tears(void) { read_fill_tears(0); }
+static void case_lf_read_verify_tears(void) { read_fill_tears(1); }
+static void case_lf_read_refill_tears(void) { read_fill_tears(2); }
+static void case_lf_alloc_terminal(void) {
+    local_mode=1; open_cache(2,0,0); u_int slots[2];
+    pthread_mutex_lock(&P->mutex); for(int i=0;i<2;i++) REQUIRE(s3b_dcache_alloc_block(P->dcache,&slots[i])==0); pthread_mutex_unlock(&P->mutex);
+    struct op *r=reader(3,0,BS,0,0); start(r); finish(r); REQUIRE(r->r==ENOMEM);
+    REQUIRE(s3b_dcache_size(P->dcache)==2 && !has_block(3)); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==ENOMEM);
+    REQUIRE(cache->shutdown(cache)==ENOMEM); cache->destroy(cache); cache=NULL; free(r);
+}
 int main(int argc, char **argv) {
     static const struct { const char *name; void (*fn)(void); } cases[] = {
+        { "lf-read-verify-tears", case_lf_read_verify_tears }, { "lf-read-refill-tears", case_lf_read_refill_tears },
+        { "lf-alloc-terminal", case_lf_alloc_terminal },
+        { "lf-read-fill-tears", case_lf_read_fill_tears }, { "lf-remote-read-errors", case_lf_remote_read_errors },
+        { "lf-shutdown-snapshot-error", case_lf_shutdown_snapshot_error }, { "lf-shutdown-snapshot-short", case_lf_shutdown_snapshot_short },
+        { "lf-poison-during-sync", case_lf_poison_during_sync }, { "lf-poison-space-waiter", case_lf_poison_space_waiter },
+        { "ml-writer-observation-gap", case_ml_writer_observation_gap },
         { "lf-helper", case_lf_helper },
         { "lf-maxdirty", case_lf_maxdirty }, { "lf-slot-reuse", case_lf_slot_reuse },
         { "lf-read-miss-error", case_lf_read_miss_error }, { "lf-erase-error", case_lf_erase_error }, { "lf-clean-migration", case_lf_clean_migration },
