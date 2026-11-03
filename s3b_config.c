@@ -373,6 +373,11 @@ static const struct fuse_opt option_list[] = {
         .value=     1
     },
     {
+        .templ=     "--blockCacheReadDirect",
+        .offset=    offsetof(struct s3b_config, block_cache.read_direct),
+        .value=     1
+    },
+    {
         .templ=     "--blockSize=%s",
         .offset=    offsetof(struct s3b_config, block_size_str),
     },
@@ -762,6 +767,7 @@ s3backer_get_config2(int argc, char **argv, int nbd, int parse_only, fuse_opt_pr
             "blockCacheFile",
             "blockCacheNoVerify",
             "blockCacheFileAdvise",
+            "blockCacheReadDirect",
             "minWriteDelay",
             "md5CacheSize",
             "md5CacheTime",
@@ -1775,6 +1781,10 @@ validate_config(int parse_only)
         warnx("\"--blockCacheRecoverDirtyBlocks\" requires specifying \"--blockCacheFile\"");
         return -1;
     }
+    if (config.block_cache.cache_file == NULL && config.block_cache.read_direct) {
+        warnx("\"--blockCacheReadDirect\" requires specifying \"--blockCacheFile\"");
+        return -1;
+    }
     if (config.block_cache.num_protected > config.block_cache.cache_size)
         warnx("\"--blockCacheNumProtected\" is larger than cache size; this may cause performance problems");
 
@@ -2176,6 +2186,7 @@ dump_config(const struct s3b_config *const c)
       c->block_cache.cache_file != NULL ? c->block_cache.cache_file : "");
     (*c->log)(LOG_DEBUG, "%24s: %s", "block_cache_no_verify", c->block_cache.no_verify ? "true" : "false");
     (*c->log)(LOG_DEBUG, "%24s: %s", "fadvise", c->block_cache.fadvise ? "true" : "false");
+    (*c->log)(LOG_DEBUG, "%24s: %s", "block_cache_read_direct", c->block_cache.read_direct ? "true" : "false");
     if (!c->nbd) {
         (*c->log)(LOG_DEBUG, "fuse_main arguments:");
         for (i = 0; i < c->fuse_args.argc; i++)
@@ -2218,6 +2229,7 @@ usage(void)
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheMaxDirty=NUM", "Block cache maximum number of dirty blocks");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheNoVerify", "Disable verification of data loaded from cache file");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheFileAdvise", "Use posix_fadvise(2) after reading from cache file");
+    fprintf(stderr, "\t--%-27s %s\n", "blockCacheReadDirect", "Use O_DIRECT for pinned clean cache file hits");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheSize=NUM", "Block cache size (in number of blocks)");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheSync", "Block cache performs all writes synchronously");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheRecoverDirtyBlocks", "Recover dirty cache file blocks on startup");

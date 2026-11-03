@@ -277,6 +277,13 @@ block_cache_create(struct block_cache_conf *config, struct s3backer_store *inner
     struct cache_entry *entry;
     int r;
 
+    // Direct reads only apply to a cache file
+    if (config->read_direct && config->cache_file == NULL) {
+        (*config->log)(LOG_ERR, "direct cache reads require a cache file");
+        errno = EINVAL;
+        return NULL;
+    }
+
     // Initialize s3backer_store structure
     if ((s3b = calloc(1, sizeof(*s3b))) == NULL) {
         r = errno;
@@ -1829,6 +1836,8 @@ block_cache_read_pinned(struct block_cache_private *priv, struct cache_entry *en
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
     if (config->cache_file == NULL)
         memcpy(dest, (const char *)data + off, len);
+    else if (config->read_direct)
+        r = s3b_dcache_read_block_direct(priv->dcache, dslot, dest, off, len);
     else
         r = s3b_dcache_read_block(priv->dcache, dslot, dest, off, len);
     pthread_mutex_lock(&priv->mutex);

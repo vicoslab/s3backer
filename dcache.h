@@ -59,8 +59,20 @@ extern int s3b_dcache_record_block(struct s3b_dcache *priv, u_int dslot, s3b_blo
 extern int s3b_dcache_erase_block(struct s3b_dcache *priv, u_int dslot);
 extern int s3b_dcache_free_block(struct s3b_dcache *dcache, u_int dslot);
 extern int s3b_dcache_read_block(struct s3b_dcache *dcache, u_int dslot, void *dest, u_int off, u_int len);
+extern int s3b_dcache_read_block_direct(struct s3b_dcache *dcache, u_int dslot, void *dest, u_int off, u_int len);
 extern int s3b_dcache_write_block(struct s3b_dcache *dcache, u_int dslot, const void *src, u_int off, u_int len);
 extern int s3b_dcache_fsync(struct s3b_dcache *dcache);
 extern int s3b_dcache_has_mount_token(struct s3b_dcache *priv);
 extern int s3b_dcache_set_mount_token(struct s3b_dcache *priv, int32_t *old_valuep, int32_t new_value);
 
+// Direct read counters (for tests and diagnostics)
+struct s3b_dcache_direct_stats {
+    u_int       enabled;            // O_DIRECT descriptor is open and capability is enabled
+    uint64_t    aligned;            // zero-copy reads straight into the caller buffer
+    uint64_t    bounced;            // reads through the aligned per-thread bounce buffer
+    uint64_t    buffered;           // EINVAL or geometry fallbacks to the buffered path
+};
+extern void s3b_dcache_get_direct_stats(struct s3b_dcache *priv, struct s3b_dcache_direct_stats *stats);
+
+
+extern void s3b_dcache_get_direct_memory_stats(size_t *bytes, size_t *buffers, size_t *peak);
