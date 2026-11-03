@@ -1,0 +1,213 @@
+{
+  "source_commit": "fc4e813a7f0e366dbd704be74cac10e6c7005577",
+  "source_branch": "persistent-cache-flush",
+  "implementation_model": {
+    "cli": "codex",
+    "model": "gpt-6.1-sol",
+    "effort": "high",
+    "verified_rollout": true
+  },
+  "native": {
+    "cand-assert": {
+      "total": 211,
+      "failed": 0,
+      "skipped": 0,
+      "failing": []
+    },
+    "cand-asan": {
+      "total": 211,
+      "failed": 0,
+      "skipped": 0,
+      "failing": []
+    },
+    "cand-opt": {
+      "total": 211,
+      "failed": 0,
+      "skipped": 0,
+      "failing": []
+    }
+  },
+  "tsan": {
+    "passes": 87,
+    "nonpasses": 124,
+    "explicit_mapping_failures": 114,
+    "crashes_without_start_marker": 7,
+    "unverified_no_marker_crashes": 3,
+    "attempts_per_case": 1,
+    "all_pass": false
+  },
+  "guest_plugin_sha256": "60db8f12194364bca9b15c413a4ca651fd5a10ed417f18c956638e956c193910",
+  "host_plugin_sha256": "da6d2e6513dc066922d43c244ce1c305d5b40c1175313ecee0567c14e570ba3e",
+  "independent_review": {
+    "verdict": "ACCEPT",
+    "focused_passes": 54,
+    "report_sha256": "0d9eee6039f1f3bc41866175e7b1dd6fe250a7bc6b42c35db3989ead824592a6"
+  },
+  "vm": {
+    "status": "PASS_FUNCTIONAL_AND_TINY_PERFORMANCE",
+    "export_bytes": 10737418240,
+    "cache_slots": 320,
+    "block_bytes": 16777216,
+    "lower_bytes": 8589934592,
+    "raw_low_pressure": {
+      "data_puts": 0,
+      "startup_metadata_puts": 1,
+      "dirty_ratio": 0.00625,
+      "flush_fua_errno": 0,
+      "after_delay_seconds": 6
+    },
+    "process_crash_reopen": {
+      "known_partial_rewrite_match": true,
+      "data_puts": 0,
+      "kernel_nbd_attached": false
+    },
+    "explicit_drain": {
+      "normal_blocks_written": 2,
+      "dirty_ratio": 0,
+      "requested": 1,
+      "completed": 1,
+      "errno": 0
+    },
+    "fresh_cache_disabled_reader": {
+      "known_bytes_match": true,
+      "data_gets": 2,
+      "puts": 0
+    },
+    "pressure": {
+      "slots": 4,
+      "distinct_patterns": 5,
+      "known_bytes_match": true,
+      "puts_increased": true
+    },
+    "mounted_xfs": {
+      "known_bytes": 67108864,
+      "rewrite_bytes": 1048576,
+      "data_puts": 0,
+      "dirty_ratio": 0.025,
+      "flush_errno": 0
+    },
+    "normal_dirty_shutdown": {
+      "no_explicit_drain": true,
+      "backend_expected_bytes_match": true,
+      "header_flags_after": 1,
+      "normal_exit": true
+    },
+    "final": {
+      "manual_endpoints_unchanged": true,
+      "owned_live_processes": 0,
+      "nbd_detached": true,
+      "top_unmounted": true,
+      "new_kernel_errors": 0,
+      "lower_cache_and_backend_retained": true
+    }
+  },
+  "performance": {
+    "payload_bytes": 134217728,
+    "workers": 1,
+    "split_bytes": 52428800,
+    "repetitions": 1,
+    "reads": 2,
+    "hashing": "none in timed performance",
+    "cache_history": "ON has prior qualification/history; OFF fresh plus matching 64MiB allocation fixture. Warm short smoke, not ranking or power-loss evidence.",
+    "arms": {
+      "off": {
+        "ls": {
+          "seconds": 0.0036913049989379942,
+          "payload_equivalent_MiB_s": null,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.00000000"
+        },
+        "owned-delete": {
+          "seconds": 0.0076903139997739345,
+          "payload_equivalent_MiB_s": null,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.00000000"
+        },
+        "read1": {
+          "seconds": 0.0639173599993228,
+          "payload_equivalent_MiB_s": 2002.5858389857804,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.00000000"
+        },
+        "read2": {
+          "seconds": 0.06396847900032299,
+          "payload_equivalent_MiB_s": 2000.985516622237,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.00000000"
+        },
+        "sync-f": {
+          "seconds": 3.571646400996542,
+          "payload_equivalent_MiB_s": null,
+          "puts_delta": 10,
+          "dirty_ratio_after": "0.00000000"
+        },
+        "write-ack": {
+          "seconds": 0.41475275299308123,
+          "payload_equivalent_MiB_s": 308.61760187553296,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.00000000"
+        }
+      },
+      "on": {
+        "ls": {
+          "seconds": 0.01585244799935026,
+          "payload_equivalent_MiB_s": null,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.05000000"
+        },
+        "owned-delete": {
+          "seconds": 0.06408379599452019,
+          "payload_equivalent_MiB_s": null,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.05000000"
+        },
+        "read1": {
+          "seconds": 0.11402488099702168,
+          "payload_equivalent_MiB_s": 1122.5620134902254,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.05000000"
+        },
+        "read2": {
+          "seconds": 0.06395225100277457,
+          "payload_equivalent_MiB_s": 2001.4932702595052,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.05000000"
+        },
+        "sync-f": {
+          "seconds": 0.3648549979989184,
+          "payload_equivalent_MiB_s": null,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.05000000"
+        },
+        "write-ack": {
+          "seconds": 0.41460755599837285,
+          "payload_equivalent_MiB_s": 308.72568082310187,
+          "puts_delta": 0,
+          "dirty_ratio_after": "0.02500000"
+        }
+      }
+    }
+  },
+  "failures_preserved": [
+    "Initial independent BLOCK with 3 native correctness reproductions; fixed by source_commit",
+    "Predecessor optimized reader-vs-write 198/199: wrapper observed writer before libc queued it; deterministic proof and test correction retained",
+    "VM absolute PUT=0 guard rejected startup token PUT before payload; authenticated no-payload continuation",
+    "Cache-disabled reader lacks block-cache stats; authenticated existing-reader continuation verified actual backend reads"
+  ],
+  "limits": [
+    "No VM hard reset or physical power-loss test",
+    "Depends on truthful filesystem/device/Ceph flush semantics",
+    "TSan non-passes remain; not race-freedom evidence",
+    "Tiny single-repetition warm performance; not a general speedup result"
+  ],
+  "receipt_hashes": {
+    "builds/correction-final-full/receipt.json": "f2a066151f070beacea227168324bdfc4351739aa63f986179f4ac8e265f3355",
+    "builds/correction-final-tsan/receipt.json": "d040d79f6d1a52fc4dea15bf182e4681302dc6d08fe960203c452fc38c81a7ca",
+    "progress/vm-receipt-inventory.json": "73b9d692dbc952a6beb9a60fd183ff9c9345c88e705033fb6684d44d45198b7d",
+    "vm-receipts/final-readback.json": "7d2722128057ee374322184c318199edce092aba7e7e8fafb097c1146c8459d9",
+    "vm-receipts/backend-proof.json": "74842746310e08376f3b95ad69e6acc878df93c4d1a6ff011ccbcf1d403ce7b0",
+    "vm-receipts/dirty-shutdown-proof.json": "67c2106f9292368636c4281938fe611b0a05034f940964e0214837c6d01df82f",
+    "vm-receipts/perf-on.json": "79183f8f2e68bec6199d9a3b10da15adaf70199a64f868ef56962b8119e802f7",
+    "vm-receipts/perf-off.json": "a4fe977bbb567982b9508c90143ab3d521eea7f0a4986f091f3c136911ca6338"
+  }
+}

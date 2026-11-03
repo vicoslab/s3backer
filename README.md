@@ -8,6 +8,8 @@ This branch adds stable per-entry reader/writer locks below a short global house
 
 See the [locking contract](docs/locking.md), [native regression/build instructions](tests/multilevel/README.md), and [isolated mounted validation](docs/multilevel-validation.md). The validation includes the original buffered application pipeline, not just native fixtures; it does not establish power-loss durability or authorize a production rollout. Normal build instructions remain in [INSTALL](INSTALL).
 
+Persistent FILE caches can opt into local-durable FLUSH/FUA with `--blockCacheLocalFlush`; the default retains remote durability. Read the [local-cache operation, drain and compatibility contract](docs/local-cache-flush.md) before enabling it, and the [native/isolated-VM validation and limits](docs/local-cache-validation.md). A locally acknowledged cache can contain the only copy of data; do not delete it or bypass its recovery safeguards.
+
 
 This arrangement has several benefits compared to more complete S3 filesystem implementations:
 
