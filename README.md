@@ -2,6 +2,13 @@
 
 In typical usage, a normal filesystem is mounted on top of the file exported by the **s3backer** filesystem using a loopback mount (or disk image mount on Mac OS X).
 
+### Multilevel block-cache branch
+
+This branch adds stable per-entry reader/writer locks below a short global housekeeping mutex. CLEAN and DIRTY reads can share an entry; a write excludes only that entry. Upload workers release the shared snapshot lock before network I/O. A single admission/drain gate protects shutdown.
+
+See the [locking contract](docs/locking.md), [native regression/build instructions](tests/multilevel/README.md), and [isolated mounted validation](docs/multilevel-validation.md). The validation includes the original buffered application pipeline, not just native fixtures; it does not establish power-loss durability or authorize a production rollout. Normal build instructions remain in [INSTALL](INSTALL).
+
+
 This arrangement has several benefits compared to more complete S3 filesystem implementations:
 
   * By not attempting to implement a complete filesystem, which is a complex undertaking and difficult to get right, **s3backer** can stay very lightweight and simple. Only three HTTP operations are used: GET, PUT, and DELETE.  All of the experience and knowledge about how to properly implement filesystems that already exists can be reused.

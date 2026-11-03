@@ -1,0 +1,778 @@
+{
+  "schema": 1,
+  "official_upstream": "https://github.com/archiecobbs/s3backer.git",
+  "official_base": "76bab1493018e3388bf4da7ec714adb02ddd1d74",
+  "validated_baseline_commit": "444f902bcb36fc0da22d31b8bd030da72f2258e2",
+  "accepted_native_commit": "89fbc9b54e2a51931c56dda37e7831a21c5687f3",
+  "native_counts": {
+    "cand-assert": {
+      "executed_pass": 191,
+      "legacy_expected_failure_controls": 9,
+      "unexpected_failures": []
+    },
+    "cand-opt": {
+      "executed_pass": 191,
+      "legacy_expected_failure_controls": 9,
+      "unexpected_failures": []
+    },
+    "cand-asan": {
+      "executed_pass": 191,
+      "legacy_expected_failure_controls": 9,
+      "unexpected_failures": []
+    },
+    "cand-tsan": {
+      "executed_pass": 191,
+      "legacy_expected_failure_controls": 9,
+      "unexpected_failures": []
+    }
+  },
+  "native_receipt_sha256": "83cdc5512d223f6eb61545188a3245e433e91cdcf35d673207027d67a8895df7",
+  "independent_review_sha256": "63cc1797a1710c930ed1c563a75cd2668099677a00e05577812c0e32a5cd6481",
+  "tsan_startup": {
+    "attempt_basis_counts": {
+      "mapping-message": 242,
+      "no-start-marker": 15,
+      "unverified-no-marker": 20
+    },
+    "cells_with_retries": 116,
+    "max_attempts": 10,
+    "attempt_logs": 477,
+    "log_scan": {
+      "unexpected_memory_mapping": 242,
+      "timeout_dumped_core": 35
+    }
+  },
+  "workload": {
+    "workers": 16,
+    "per_worker_mib": 1280,
+    "total_mib": 20480,
+    "split_mib": 50,
+    "write_rounds": 1,
+    "immediate_read_passes": 5,
+    "separate_settled_read_passes": 2,
+    "pipeline": "unchanged reader_pins_runner.WRITE / READ (dd | pv | split; tar | pv to null), original timed ls -lA",
+    "timed_payload_hashing": false,
+    "integrity": "separate 8x20MiB deterministic write/rewrite/fsync/readback and normal restart per arm",
+    "arm_order": [
+      "baseline",
+      "candidate"
+    ]
+  },
+  "comparisons": {
+    "write": {
+      "baseline_mib_s": 553.8445087598737,
+      "candidate_mib_s": 816.001831000303,
+      "ratio": 1.4733410155630717,
+      "change_percent": 47.334101556307175,
+      "phases": [
+        "write"
+      ]
+    },
+    "read1": {
+      "baseline_mib_s": 461.3187666715717,
+      "candidate_mib_s": 441.8079353884128,
+      "ratio": 0.9577064002318176,
+      "change_percent": -4.229359976818237,
+      "phases": [
+        "read1"
+      ]
+    },
+    "first_two_transition_reads": {
+      "baseline_mib_s": 472.7304288798045,
+      "candidate_mib_s": 652.986246926543,
+      "ratio": 1.3813078385368123,
+      "change_percent": 38.13078385368123,
+      "phases": [
+        "read1",
+        "read2"
+      ]
+    },
+    "five_consecutive_reads": {
+      "baseline_mib_s": 861.1160609100988,
+      "candidate_mib_s": 1082.0248382811194,
+      "ratio": 1.256537750715677,
+      "change_percent": 25.653775071567697,
+      "phases": [
+        "read1",
+        "read2",
+        "read3",
+        "read4",
+        "read5"
+      ]
+    },
+    "strict_clean_first_pass": {
+      "baseline_mib_s": 1900.078785597782,
+      "candidate_mib_s": 1923.7835914597438,
+      "ratio": 1.0124756962930377,
+      "change_percent": 1.2475696293037686,
+      "phases": [
+        "clean1"
+      ]
+    },
+    "two_settled_reads": {
+      "baseline_mib_s": 1930.744894573909,
+      "candidate_mib_s": 1914.5564301007232,
+      "ratio": 0.9916154306461298,
+      "change_percent": -0.8384569353870219,
+      "phases": [
+        "clean1",
+        "clean2"
+      ]
+    }
+  },
+  "limitations": [
+    "One fixed-order freshly written trial per arm, not repeated/alternated statistics; scratch geometry is matched but smaller than the retained 100GiB native-cache manual endpoint.",
+    "Immediate reads are transitioning DIRTY/mixed cohorts, not constant matched dirty occupancy. Baseline Read1 begins 70.4% dirty; candidate Read1 begins 81.4% dirty. Candidate Read2 starts much cleaner, so its isolated speedup is not a pure DIRTY-read-lock gain.",
+    "Candidate settled Read2 ends one dirty native slot; only settled Read1 is strictly CLEAN in both arms.",
+    "No payload hashing in performance phases; known-pattern/restart qualification is separate. No power-loss/crash durability claim.",
+    "TSan has verified successful executions but 20 markerless crash attempts were classified as assumed startup failures, not proven; all failures/logs preserved, no claim of flawless sanitizer operation.",
+    "Leaf file-size mutex still serializes file-extending payload writes during initial cache growth; optional N1 optimization deferred.",
+    "Writer preference is glibc-specific; no FIFO guarantee among writers.",
+    "No GitHub fork or push; no production endpoint rollout. S3 scratch prefixes retained."
+  ],
+  "geometry": {
+    "logical_image_gib": 64,
+    "native_cache_gib": 24,
+    "lower_lv_gib": 28,
+    "block_mib": 16,
+    "slots": 1536,
+    "request_threads": 48,
+    "upload_workers": 48,
+    "write_delay_ms": 4294967232,
+    "max_dirty": 0,
+    "read_ahead_blocks": 16,
+    "read_ahead_trigger": 2,
+    "kernel_read_ahead_kib": 16384,
+    "lower_read_direct": true,
+    "lower_direct_scope": "CLEAN hits; DIRTY/WRITING reads remain buffered but per-entry shared",
+    "shared_fast_wbt_us": 0,
+    "frontend": "direct XFS path on isolated kernel NBD; not NFS-client throughput"
+  },
+  "arms": {
+    "baseline": {
+      "plugin_sha256": "adde0db290159c18c927984e04b426a249fba3b47a9f921df375ab77a510f0b9",
+      "performance_receipt_sha256": "02986ef6a882c8a4558e574085b55433bb42631f081a1e935fba153afbc2052c",
+      "complete_receipt_sha256": "245ee54c0dba187ada46e1a5634aab41f0baa603da510dc8cede696250f5dac1",
+      "manifest_sha256": "0e5cfa7ce6e02506de43db99865606cdde52e75152fca365852ab49cfe6599c5",
+      "file_count": 416,
+      "bytes": 21474836480,
+      "normal_restart_readback": true,
+      "phases": {
+        "write": {
+          "elapsed_seconds": 36.97788761300035,
+          "payload_equivalent_mib_s": 553.8445087598737,
+          "native_dirty_before": 0.00065104,
+          "native_dirty_after": 0.67317708,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 62976,
+          "fast_disk_read_bytes": 2252239872,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 166,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 166,
+            "block_cache_read_hits": 57,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            522.770839,
+            1033.182618
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 2.932548522949219e-06,
+          "daemon_cpu_cores_in_snapshot_window": 0.9557363240939009
+        },
+        "list": {
+          "elapsed_seconds": 0.11472924100235105,
+          "payload_equivalent_mib_s": null,
+          "native_dirty_before": 0.70377604,
+          "native_dirty_after": 0.70377604,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 0,
+          "fast_disk_read_bytes": 0,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 0,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            63.887903,
+            202.560617
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": null,
+          "daemon_cpu_cores_in_snapshot_window": 0.7211223975900551
+        },
+        "read1": {
+          "elapsed_seconds": 44.39446534500166,
+          "payload_equivalent_mib_s": 461.3187666715717,
+          "native_dirty_before": 0.70377604,
+          "native_dirty_after": 0.48567708,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 21391097856,
+          "fast_disk_read_bytes": 27447943168,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 374,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 374,
+            "block_cache_read_hits": 19814,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            258.203503,
+            104.686268
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9961006164550781,
+          "daemon_cpu_cores_in_snapshot_window": 1.4007975017635406
+        },
+        "read2": {
+          "elapsed_seconds": 42.25111001400364,
+          "payload_equivalent_mib_s": 484.72099296828276,
+          "native_dirty_before": 0.48567708,
+          "native_dirty_after": 0.04101562,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 21036126208,
+          "fast_disk_read_bytes": 30680702976,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 685,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 685,
+            "block_cache_read_hits": 19077,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            290.092049,
+            534.398804
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9795709609985351,
+          "daemon_cpu_cores_in_snapshot_window": 2.187765956553317
+        },
+        "read3": {
+          "elapsed_seconds": 11.493404027998622,
+          "payload_equivalent_mib_s": 1781.891591917372,
+          "native_dirty_before": 0.04101562,
+          "native_dirty_after": 0.00325521,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 21035864064,
+          "fast_disk_read_bytes": 21069963264,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 68,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 68,
+            "block_cache_read_hits": 20061,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            597.824191,
+            26.868582
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9795587539672852,
+          "daemon_cpu_cores_in_snapshot_window": 1.0822499434573745
+        },
+        "read4": {
+          "elapsed_seconds": 10.38985217300069,
+          "payload_equivalent_mib_s": 1971.1541279884425,
+          "native_dirty_before": 0.00325521,
+          "native_dirty_after": 0.00325521,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 20503572480,
+          "fast_disk_read_bytes": 20504784896,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 18839,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            117.266641,
+            513.396502
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9547719955444336,
+          "daemon_cpu_cores_in_snapshot_window": 0.9934740549452282
+        },
+        "read5": {
+          "elapsed_seconds": 10.38661392799986,
+          "payload_equivalent_mib_s": 1971.7686766801596,
+          "native_dirty_before": 0.00325521,
+          "native_dirty_after": 0.00325521,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 20501475328,
+          "fast_disk_read_bytes": 20484747264,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 18873,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            586.019232,
+            987.886604
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9546743392944336,
+          "daemon_cpu_cores_in_snapshot_window": 0.9725477065666847
+        },
+        "clean1": {
+          "elapsed_seconds": 10.778500426000392,
+          "payload_equivalent_mib_s": 1900.078785597782,
+          "native_dirty_before": 0.0,
+          "native_dirty_after": 0.0,
+          "cache_state": "CLEAN",
+          "nbd_read_bytes": 20501475328,
+          "fast_disk_read_bytes": 20501475328,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 19536,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            364.501901,
+            157.871635
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9546743392944336,
+          "daemon_cpu_cores_in_snapshot_window": 0.9928554439007428
+        },
+        "clean2": {
+          "elapsed_seconds": 10.436109600996133,
+          "payload_equivalent_mib_s": 1962.417105895972,
+          "native_dirty_before": 0.0,
+          "native_dirty_after": 0.0,
+          "cache_state": "CLEAN",
+          "nbd_read_bytes": 20501032960,
+          "fast_disk_read_bytes": 20501032960,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 18635,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            266.205897,
+            709.548437
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9546537399291992,
+          "daemon_cpu_cores_in_snapshot_window": 0.9889877805072461
+        }
+      }
+    },
+    "candidate": {
+      "plugin_sha256": "42c582262395024831303b458ee92549f7329c7d7a465db3cb45d6f754dbb37c",
+      "performance_receipt_sha256": "ae19b90fb0897f5230c2823960ccd6ab2eeccddcc040e8f0fa780c09b2138b35",
+      "complete_receipt_sha256": "f911376822fbbe610b5e79bf2d07455fc0cc1f1321cfc6274ee91a9873ad588b",
+      "manifest_sha256": "c37d2ede54eced4b169290fe4ba6efae5fd6bfac8ccb76e38e7ad9cba67411ba",
+      "file_count": 416,
+      "bytes": 21474836480,
+      "normal_restart_readback": true,
+      "phases": {
+        "write": {
+          "elapsed_seconds": 25.09798289900209,
+          "payload_equivalent_mib_s": 816.001831000303,
+          "native_dirty_before": 0.00065104,
+          "native_dirty_after": 0.77994792,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 41984,
+          "fast_disk_read_bytes": 73728,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 75,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            851.391081,
+            958.214424
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 1.9550323486328123e-06,
+          "daemon_cpu_cores_in_snapshot_window": 0.6244452232278869
+        },
+        "list": {
+          "elapsed_seconds": 0.006618154999159742,
+          "payload_equivalent_mib_s": null,
+          "native_dirty_before": 0.81445312,
+          "native_dirty_after": 0.81445312,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 0,
+          "fast_disk_read_bytes": 0,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 0,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            34.464692,
+            69.613656
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": null,
+          "daemon_cpu_cores_in_snapshot_window": 1.13801362680277
+        },
+        "read1": {
+          "elapsed_seconds": 46.35498450700106,
+          "payload_equivalent_mib_s": 441.8079353884128,
+          "native_dirty_before": 0.81445312,
+          "native_dirty_after": 0.12565104,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 20327436288,
+          "fast_disk_read_bytes": 37407289344,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 1096,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 1096,
+            "block_cache_read_hits": 18780,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            129.480777,
+            350.786721
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9465700149536133,
+          "daemon_cpu_cores_in_snapshot_window": 3.320587534957732
+        },
+        "read2": {
+          "elapsed_seconds": 16.372217164993344,
+          "payload_equivalent_mib_s": 1250.8996059366848,
+          "native_dirty_before": 0.12565104,
+          "native_dirty_after": 0.00065104,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 20340019200,
+          "fast_disk_read_bytes": 22565072896,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 205,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 205,
+            "block_cache_read_hits": 18199,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            413.889366,
+            762.77776
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9471559524536133,
+          "daemon_cpu_cores_in_snapshot_window": 1.895372637669417
+        },
+        "read3": {
+          "elapsed_seconds": 10.58407793299557,
+          "payload_equivalent_mib_s": 1934.9819728891232,
+          "native_dirty_before": 0.00065104,
+          "native_dirty_after": 0.00130208,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 20340019200,
+          "fast_disk_read_bytes": 20340019200,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 3,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 3,
+            "block_cache_read_hits": 19008,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            814.026648,
+            409.891697
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9471559524536133,
+          "daemon_cpu_cores_in_snapshot_window": 1.0194616036844328
+        },
+        "read4": {
+          "elapsed_seconds": 10.681904188000772,
+          "payload_equivalent_mib_s": 1917.2611586430119,
+          "native_dirty_before": 0.00130208,
+          "native_dirty_after": 0.00195312,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 20340019200,
+          "fast_disk_read_bytes": 20340019200,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 19332,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            467.574363,
+            160.247104
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9471559524536133,
+          "daemon_cpu_cores_in_snapshot_window": 1.0027621349350877
+        },
+        "read5": {
+          "elapsed_seconds": 10.64420009800233,
+          "payload_equivalent_mib_s": 1924.0525179382548,
+          "native_dirty_before": 0.00195312,
+          "native_dirty_after": 0.00195312,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 20340019200,
+          "fast_disk_read_bytes": 20340019200,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 17705,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            214.660466,
+            874.791732
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9471559524536133,
+          "daemon_cpu_cores_in_snapshot_window": 0.993632945753948
+        },
+        "clean1": {
+          "elapsed_seconds": 10.645688054995844,
+          "payload_equivalent_mib_s": 1923.7835914597438,
+          "native_dirty_before": 0.0,
+          "native_dirty_after": 0.0,
+          "cache_state": "CLEAN",
+          "nbd_read_bytes": 20340019200,
+          "fast_disk_read_bytes": 20340019200,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 0,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 0,
+            "block_cache_read_hits": 18903,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            354.284584,
+            31.051878
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9471559524536133,
+          "daemon_cpu_cores_in_snapshot_window": 1.0005111598412582
+        },
+        "clean2": {
+          "elapsed_seconds": 10.748301360006735,
+          "payload_equivalent_mib_s": 1905.4173598261639,
+          "native_dirty_before": 0.0,
+          "native_dirty_after": 0.00065104,
+          "cache_state": "DIRTY_OR_MIXED",
+          "nbd_read_bytes": 20340019200,
+          "fast_disk_read_bytes": 20340019200,
+          "native_delta": {
+            "http_gets": 0,
+            "http_puts": 1,
+            "http_normal_blocks_read": 0,
+            "http_normal_blocks_written": 1,
+            "block_cache_read_hits": 17579,
+            "block_cache_read_misses": 0
+          },
+          "mirror_age_ms": [
+            88.688125,
+            856.081978
+          ],
+          "peer_nbd_delta": {
+            "nbd1": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            },
+            "nbd2": {
+              "read_bytes": 0,
+              "write_bytes": 0
+            }
+          },
+          "nbd_read_fraction_of_payload": 0.9471559524536133,
+          "daemon_cpu_cores_in_snapshot_window": 1.0156727472885025
+        }
+      }
+    }
+  },
+  "scope": "Source, native fake-backend tests and one fixed-order isolated direct-XFS mounted trial per arm; no production deployment or power-loss claim.",
+  "operator_raw_inventory_sha256": "e9ee9a2c578572938dba67260c65a12832c2bafd7c2c863b4af23ae81cc9dbfd",
+  "cleanup": {
+    "owned_scratch_lower_gib": 28,
+    "reclaimed_bytes": 30064771072,
+    "unmounted_and_detached_before_remove": true,
+    "operator_endpoints_preserved": true,
+    "s3_scratch_prefixes_retained": true
+  }
+}
