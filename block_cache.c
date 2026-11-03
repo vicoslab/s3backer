@@ -39,6 +39,8 @@
 #include "dcache.h"
 #include "hash.h"
 #include "util.h"
+#include <semaphore.h>
+#include <signal.h>
 
 /*
  * This file implements a simple block cache that acts as a "layer" on top
@@ -232,6 +234,15 @@ struct block_cache_private {
     u_int                           num_pins;       // sum of entry->readers
     u_int                           num_refs;       // sum of entry->readers + entry->excl_waiters
     u_int                           active_ops;     // admitted read/write requests that have not returned (shutdown drains these)
+    u_int                           local_writes;
+    pthread_t                       drain_thread;
+    int                             drain_started;
+    int                             drain_stop;
+    uint64_t                        drain_start_ticks;
+    uint64_t                        drain_requested, drain_completed, drain_errors;
+    int                             drain_error;
+    int                             shutdown_error;
+    int                             local_syncing;
     int                             draining;       // shutdown has begun: no new requests are admitted
     u_int                           unpin_waiters;  // threads waiting on 'unpinned'
     u_int                           space_pin_waiters;// allocators waiting because all CLEAN[2] entries are busy
@@ -294,6 +305,36 @@ static struct cache_entry *block_cache_first_idle(struct list_head *list);
 static int block_cache_write_data(struct block_cache_private *priv, struct cache_entry *entry, const void *src, u_int off,
   u_int len);
 
+static int block_cache_remote_flush(struct s3backer_store *, const s3b_block_t *, u_int, long);
+
+/* Process-lifetime semaphore: a late signal can never touch freed cache memory. */
+static sem_t block_cache_drain_sem;
+static pthread_once_t block_cache_drain_once = PTHREAD_ONCE_INIT;
+static int block_cache_drain_init_error;
+static void block_cache_drain_init(void) {
+    if (sem_init(&block_cache_drain_sem, 0, 0) == -1) block_cache_drain_init_error = errno;
+}
+static void block_cache_drain_signal(int sig) {
+    int saved = errno;
+    (void)sig;
+    sem_post(&block_cache_drain_sem);
+    errno = saved;
+}
+static void *block_cache_drain_main(void *arg) {
+    struct s3backer_store *s3b = arg;
+    struct block_cache_private *priv = s3b->data;
+    for (;;) {
+        while (sem_wait(&block_cache_drain_sem) == -1 && errno == EINTR) ;
+        pthread_mutex_lock(&priv->mutex);
+        int stop = priv->drain_stop;
+        pthread_mutex_unlock(&priv->mutex);
+        if (stop) break;
+        int r = block_cache_remote_drain(s3b, 300000);
+        (*priv->config->log)(r ? LOG_ERR : LOG_INFO, "remote drain completed: %s", r ? strerror(r) : "ok");
+    }
+    return NULL;
+}
+
 // Invariants checking
 #ifndef NDEBUG
 static void block_cache_check_invariants(struct block_cache_private *priv, int allow_stopping);
@@ -317,6 +358,8 @@ block_cache_create(struct block_cache_conf *config, struct s3backer_store *inner
     struct cache_entry *entry;
     int r;
 
+    if (config->local_flush && (!config->cache_file || !config->recover_dirty_blocks
+      || config->no_verify || config->synchronous)) { errno = EINVAL; return NULL; }
     // Direct reads only apply to a cache file
     if (config->read_direct && config->cache_file == NULL) {
         (*config->log)(LOG_ERR, "direct cache reads require a cache file");
@@ -388,7 +431,7 @@ block_cache_create(struct block_cache_conf *config, struct s3backer_store *inner
 
     // Initialize on-disk cache and read in directory
     if (config->cache_file != NULL) {
-        if ((r = s3b_dcache_open(&priv->dcache, config, block_cache_dcache_load, priv, config->perform_flush)) != 0)
+        if ((r = s3b_dcache_open(&priv->dcache, config, block_cache_dcache_load, priv, config->local_flush || config->perform_flush)) != 0)
             goto fail10;
         if (config->perform_flush && priv->num_dirties > 0) {
             (*config->log)(LOG_INFO, "%u dirty blocks in cache file \"%s\" will be recovered",
@@ -461,7 +504,7 @@ block_cache_dcache_load(void *arg, s3b_block_t dslot, s3b_block_t block_num, con
 
     // Sanity check
     assert(config->cache_file != NULL);
-    assert(!dirty || config->perform_flush);            // we should never see dirty blocks unless we asked for them
+    assert(!dirty || config->perform_flush || config->local_flush);            // we should never see dirty blocks unless we asked for them
 
     // Sanity check a block is not listed twice
     if ((entry = s3b_hash_get(priv->hashtable, block_num)) != NULL) {
@@ -479,7 +522,7 @@ block_cache_dcache_load(void *arg, s3b_block_t dslot, s3b_block_t block_num, con
         return r;
     }
     entry->block_num = block_num;
-    entry->timeout = block_cache_get_time(priv) + priv->clean_timeout;
+    entry->timeout = dirty && config->local_flush ? READING_TIMEOUT : block_cache_get_time(priv) + priv->clean_timeout;
     entry->u.dslot = dslot;
 
     // Mark as clean or dirty accordingly
@@ -511,6 +554,29 @@ block_cache_create_threads(struct s3backer_store *s3b)
     if ((r = (*priv->inner->create_threads)(priv->inner)) != 0)
         return r;
 
+    if (config->local_flush) {
+        struct sigaction sa;
+        char line[4096], *cursor, *end;
+        FILE *fp = fopen("/proc/self/stat", "r");
+        if (!fp) return errno;
+        if (!fgets(line, sizeof(line), fp)) { fclose(fp); return EIO; }
+        fclose(fp);
+        cursor = strrchr(line, ')');
+        if (!cursor) return EIO;
+        cursor += 2;
+        for (int field = 3; field < 22; field++) {
+            cursor = strchr(cursor, ' '); if (!cursor) return EIO; cursor++;
+        }
+        priv->drain_start_ticks = strtoull(cursor, &end, 10);
+        if (end == cursor) return EIO;
+        pthread_once(&block_cache_drain_once, block_cache_drain_init);
+        if (block_cache_drain_init_error) return block_cache_drain_init_error;
+        memset(&sa, 0, sizeof(sa)); sa.sa_handler = block_cache_drain_signal;
+        sigemptyset(&sa.sa_mask); sa.sa_flags = SA_RESTART;
+        if (sigaction(SIGUSR1, &sa, NULL) == -1) return errno;
+        if ((r = pthread_create(&priv->drain_thread, NULL, block_cache_drain_main, s3b)) != 0) return r;
+        priv->drain_started = 1;
+    }
     // Grab lock
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 0);
@@ -523,6 +589,16 @@ block_cache_create_threads(struct s3backer_store *s3b)
     }
 
 fail:
+    if (r && config->local_flush) {
+        u_int n = priv->num_threads;
+        priv->stopping = 1; priv->drain_stop = 1;
+        pthread_cond_broadcast(&priv->worker_work);
+        pthread_mutex_unlock(&priv->mutex);
+        sem_post(&block_cache_drain_sem);
+        pthread_join(priv->drain_thread, NULL); priv->drain_started = 0;
+        for (u_int i = 0; i < n; i++) pthread_join(priv->threads[i], NULL);
+        return r;
+    }
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
     return r;
 }
@@ -541,6 +617,12 @@ block_cache_set_mount_token(struct s3backer_store *s3b, int32_t *old_valuep, int
     struct block_cache_private *const priv = s3b->data;
     int r;
 
+    if (priv->config->local_flush && new_value == 0) {
+        pthread_mutex_lock(&priv->mutex);
+        r = priv->num_dirties || !priv->stopping || priv->shutdown_error ? EBUSY : s3b_dcache_error(priv->dcache);
+        pthread_mutex_unlock(&priv->mutex);
+        if (r) return r;
+    }
     // Set flag in lower layer
     if ((r = (*priv->inner->set_mount_token)(priv->inner, old_valuep, new_value)) != 0)
         return r;
@@ -549,12 +631,46 @@ block_cache_set_mount_token(struct s3backer_store *s3b, int32_t *old_valuep, int
     if (priv->dcache != NULL && new_value >= 0)
         r = s3b_dcache_set_mount_token(priv->dcache, NULL, new_value);
 
+    if (priv->config->local_flush && !r && new_value == 0)
+        r = s3b_dcache_clear_local_ack(priv->dcache);
     // Done
-    return 0;
+    return priv->config->local_flush ? r : 0;
+}
+
+/* Local FLUSH closes write admission at a finite snapshot. Existing admitted writers
+ * finish with workers alive; future writers wait. Never hold the cache mutex over sync. */
+static int
+block_cache_local_flush(struct s3backer_store *s3b)
+{
+    struct block_cache_private *priv = s3b->data;
+    int r;
+    pthread_mutex_lock(&priv->mutex);
+    while (priv->local_syncing && !priv->draining)
+        pthread_cond_wait(&priv->unpinned, &priv->mutex);
+    if (priv->draining) { pthread_mutex_unlock(&priv->mutex); return ENOTCONN; }
+    priv->active_ops++;
+    priv->local_syncing = 1;
+    while (priv->local_writes)
+        pthread_cond_wait(&priv->unpinned, &priv->mutex);
+    pthread_mutex_unlock(&priv->mutex);
+    r = s3b_dcache_fsync(priv->dcache);
+    pthread_mutex_lock(&priv->mutex);
+    priv->local_syncing = 0;
+    block_cache_op_done(priv);
+    pthread_cond_broadcast(&priv->unpinned);
+    pthread_mutex_unlock(&priv->mutex);
+    return r;
+}
+static int
+block_cache_flush_blocks(struct s3backer_store *s3b, const s3b_block_t *blocks, u_int n, long timeout)
+{
+    struct block_cache_private *priv = s3b->data;
+    if (priv->config->local_flush) return block_cache_local_flush(s3b);
+    return block_cache_remote_flush(s3b, blocks, n, timeout);
 }
 
 static int
-block_cache_flush_blocks(struct s3backer_store *s3b, const s3b_block_t *block_nums, u_int num_blocks, long timeout)
+block_cache_remote_flush(struct s3backer_store *s3b, const s3b_block_t *block_nums, u_int num_blocks, long timeout)
 {
     struct block_cache_private *const priv = s3b->data;
     struct block_list block_list;
@@ -593,6 +709,34 @@ block_cache_flush_blocks(struct s3backer_store *s3b, const s3b_block_t *block_nu
 done:
     // Done
     block_list_free(&block_list);
+    return r;
+}
+
+int
+block_cache_remote_drain(struct s3backer_store *s3b, long timeout)
+{
+    struct block_cache_private *priv = s3b->data;
+    int r;
+    if (!priv->config->local_flush) return EINVAL;
+    pthread_mutex_lock(&priv->mutex);
+    if (priv->draining) { pthread_mutex_unlock(&priv->mutex); return ENOTCONN; }
+    priv->active_ops++;
+    priv->drain_requested++;
+    pthread_mutex_unlock(&priv->mutex);
+    if ((r = block_cache_local_flush(s3b)) != 0) goto completed;
+    pthread_mutex_lock(&priv->mutex);
+    if (priv->draining) { pthread_mutex_unlock(&priv->mutex); r = ENOTCONN; goto completed; }
+    pthread_mutex_unlock(&priv->mutex);
+    r = s3b_dcache_error(priv->dcache);
+    if (!r) r = block_cache_remote_flush(s3b, NULL, 0, timeout);
+    if (!r) r = s3b_dcache_fsync(priv->dcache);
+completed:
+    pthread_mutex_lock(&priv->mutex);
+    priv->drain_completed++;
+    priv->drain_error = r;
+    if (r) priv->drain_errors++;
+    block_cache_op_done(priv);
+    pthread_mutex_unlock(&priv->mutex);
     return r;
 }
 
@@ -743,6 +887,7 @@ block_cache_shutdown(struct s3backer_store *const s3b)
      * waiting for their delay, so admitted writes can publish DIRTY and blocked/synchronous requests make progress.
      */
     priv->draining = 1;
+    pthread_cond_broadcast(&priv->unpinned);
     pthread_cond_broadcast(&priv->worker_work);
     priv->unpin_waiters++;
     while (priv->active_ops > 0)
@@ -752,7 +897,7 @@ block_cache_shutdown(struct s3backer_store *const s3b)
     // Wait for all dirty blocks to be written and all worker threads to exit
     orig_num_threads = priv->num_threads;
     priv->stopping = 1;
-    while (TAILQ_FIRST(&priv->dirties) != NULL || priv->num_threads > 0) {
+    while ((!config->local_flush && TAILQ_FIRST(&priv->dirties) != NULL) || priv->num_threads > 0) {
         pthread_cond_broadcast(&priv->worker_work);
         pthread_cond_wait(&priv->worker_exit, &priv->mutex);
     }
@@ -770,8 +915,21 @@ block_cache_shutdown(struct s3backer_store *const s3b)
     // Release lock
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
 
+    if (priv->drain_started) {
+        pthread_mutex_lock(&priv->mutex); priv->drain_stop = 1; pthread_mutex_unlock(&priv->mutex);
+        sem_post(&block_cache_drain_sem);
+        pthread_join(priv->drain_thread, NULL); priv->drain_started = 0;
+    }
     // Propagate to lower layer
-    return (*priv->inner->shutdown)(priv->inner);
+    r = (*priv->inner->shutdown)(priv->inner);
+    if (config->local_flush) {
+        if (r) priv->shutdown_error = r;
+        if (s3b_dcache_error(priv->dcache)) return s3b_dcache_error(priv->dcache);
+        if (priv->shutdown_error) return priv->shutdown_error;
+        if (priv->num_dirties) return EIO;
+        if (!r) r = s3b_dcache_fsync(priv->dcache);
+    }
+    return r;
 }
 
 static void
@@ -783,7 +941,7 @@ block_cache_destroy(struct s3backer_store *const s3b)
     // Grab lock and sanity check
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 1);
-    assert(TAILQ_FIRST(&priv->dirties) == NULL && priv->num_threads == 0);
+    assert((config->local_flush || TAILQ_FIRST(&priv->dirties) == NULL) && priv->num_threads == 0);
     assert(priv->num_pins == 0 && priv->num_refs == 0 && priv->active_ops == 0 && priv->unpin_waiters == 0);
 
     // Destroy inner store
@@ -815,6 +973,14 @@ block_cache_get_stats(struct s3backer_store *s3b, struct block_cache_stats *stat
 
     pthread_mutex_lock(&priv->mutex);
     memcpy(stats, &priv->stats, sizeof(*stats));
+    stats->local_flush = priv->config->local_flush;
+    stats->drain_pid = priv->config->local_flush ? getpid() : 0;
+    stats->drain_start_ticks = priv->drain_start_ticks;
+    stats->drain_requested = priv->drain_requested;
+    stats->drain_completed = priv->drain_completed;
+    stats->drain_errors = priv->drain_errors;
+    stats->drain_error = priv->drain_error;
+    stats->local_error = s3b_dcache_error(priv->dcache);
     stats->current_size = s3b_hash_size(priv->hashtable);
     stats->dirty_ratio = block_cache_dirty_ratio(priv);
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
@@ -1118,6 +1284,7 @@ read:
     if (erase_first) {
         if ((r = s3b_dcache_erase_block(priv->dcache, entry->u.dslot)) != 0)
             (*config->log)(LOG_ERR, "can't erase cached block! %s", strerror(r));
+        if (r && config->local_flush) goto fail;
     }
     r = (*priv->inner->read_block)(priv->inner, block_num, data, etag, was_verify ? entry->etag : NULL, 0);
 
@@ -1150,6 +1317,7 @@ read:
         if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, etag)) != 0)
             (*config->log)(LOG_ERR, "can't record cached block! %s", strerror(r));
     }
+    if (r && config->local_flush) goto fail;
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 1);
 
@@ -1192,7 +1360,7 @@ fail:
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 1);
     assert(ENTRY_GET_STATE(entry) == READING || ENTRY_GET_STATE(entry) == READING2);
-    if (config->cache_file != NULL)
+    if (config->cache_file != NULL && !config->local_flush)
         s3b_dcache_free_block(priv->dcache, entry->u.dslot);
     s3b_hash_remove(priv->hashtable, entry->block_num);
     free(data);
@@ -1254,14 +1422,18 @@ block_cache_write(struct block_cache_private *const priv, s3b_block_t block_num,
     // Grab lock
     pthread_mutex_lock(&priv->mutex);
 
+    while (config->local_flush && priv->local_syncing && !priv->draining)
+        pthread_cond_wait(&priv->unpinned, &priv->mutex);
     // Admission: once shutdown has begun no new write is accepted; an admitted one completes before shutdown returns
     if (priv->draining) {
         CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
         return ENOTCONN;
     }
     priv->active_ops++;
+    priv->local_writes++;
 
 again:
+    if (config->local_flush && ((r = s3b_dcache_error(priv->dcache)) != 0 || (r = priv->shutdown_error) != 0)) goto fail;
     // Sanity check
     S3BCACHE_CHECK_INVARIANTS(priv, 0);
     if (priv->num_threads == 0) {
@@ -1278,7 +1450,14 @@ again:
         case READING2:
             pthread_cond_wait(&priv->end_reading, &priv->mutex);
             goto again;
-        case CLEAN2:                // convert to CLEAN (CLEAN2 entries are idle, the entry does not move), then proceed
+        case CLEAN2:
+            // A torn CLEAN record can contain a stale identity. Verification must precede
+            // a DIRTY marker even for a full overwrite (crash may precede its payload).
+            if (config->local_flush) {
+                if ((r = block_cache_do_read(priv, block_num, 0, 0, NULL, 0)) != 0) goto fail;
+                goto again;
+            }
+            // convert to CLEAN (CLEAN2 entries are idle, the entry does not move), then proceed
             entry->verify = 0;
             // FALLTHROUGH
         case CLEAN:                 // update data, move to state DIRTY
@@ -1324,7 +1503,7 @@ again:
             entry->dirty = 1;
             TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
             priv->num_dirties++;
-            entry->timeout = block_cache_get_time(priv) + priv->dirty_timeout;
+            entry->timeout = config->local_flush ? READING_TIMEOUT : block_cache_get_time(priv) + priv->dirty_timeout;
             pthread_cond_signal(&priv->worker_work);
             break;
         case WRITING:               // update data, move to state WRITING2
@@ -1342,16 +1521,24 @@ again:
 
         // Update the data and directory with only the entry lock held
         CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
-        if (record_dirty) {
-            if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, NULL)) != 0)
-                (*config->log)(LOG_ERR, "can't dirty cached block %u! %s", block_num,  strerror(r));
+        r = 0;
+        if (config->local_flush) {
+            if (record_dirty) {
+                r = s3b_dcache_mark_dirty(priv->dcache, entry->u.dslot);
+                if (!r) r = s3b_dcache_fsync(priv->dcache);
+            }
+            if (!r) r = block_cache_write_data(priv, entry, src, off, len);
+        } else {
+            if (record_dirty && (r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, NULL)) != 0)
+                (*config->log)(LOG_ERR, "can't dirty cached block: %s", strerror(r));
+            if ((r = block_cache_write_data(priv, entry, src, off, len)) != 0)
+                (*config->log)(LOG_ERR, "error updating dirty block: %s", strerror(r));
         }
-        if ((r = block_cache_write_data(priv, entry, src, off, len)) != 0)
-            (*config->log)(LOG_ERR, "error updating dirty block! %s", strerror(r));
         pthread_rwlock_unlock(&entry->lock);
         pthread_mutex_lock(&priv->mutex);
         S3BCACHE_CHECK_INVARIANTS(priv, 1);
         block_cache_entry_unref(priv, entry, 0);
+        if (r && config->local_flush) goto fail;
         goto success;
     }
 
@@ -1409,19 +1596,32 @@ again:
     assert(ENTRY_GET_STATE(entry) == READING);
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
 
-    // Record block data, then the dirty directory record
+    // A miss identity is invalid until payload+identity are durable, then DIRTY is issued.
     assert(off == 0 && len == config->block_size);
-    if ((r = block_cache_write_data(priv, entry, src, off, len)) != 0)
-        (*config->log)(LOG_ERR, "error updating dirty block! %s", strerror(r));
-    if (config->cache_file != NULL) {
-        if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, NULL)) != 0)
-            (*config->log)(LOG_ERR, "can't dirty cached block %u! %s", block_num,  strerror(r));
+    if (config->local_flush) {
+        r = s3b_dcache_reserve(priv->dcache, entry->u.dslot, entry->block_num);
+        if (!r) r = block_cache_write_data(priv, entry, src, off, len);
+        if (!r) r = s3b_dcache_fsync(priv->dcache);
+        if (!r) r = s3b_dcache_mark_dirty(priv->dcache, entry->u.dslot);
+    } else {
+        if ((r = block_cache_write_data(priv, entry, src, off, len)) != 0)
+            (*config->log)(LOG_ERR, "error updating dirty block: %s", strerror(r));
+        if (config->cache_file != NULL && (r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, NULL)) != 0)
+            (*config->log)(LOG_ERR, "can't dirty cached block: %s", strerror(r));
     }
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 1);
 
+    if (config->local_flush && r) {
+        // Quarantine the failed slot: its record/payload may be partially written.
+        s3b_hash_remove(priv->hashtable, entry->block_num);
+        block_cache_entry_free(entry);
+        pthread_cond_broadcast(&priv->end_reading);
+        pthread_cond_broadcast(&priv->space_avail);
+        goto fail;
+    }
     // Change the new entry from READING to DIRTY
-    entry->timeout = block_cache_get_time(priv) + priv->dirty_timeout;
+    entry->timeout = config->local_flush ? READING_TIMEOUT : block_cache_get_time(priv) + priv->dirty_timeout;
     entry->dirty = 1;
     TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
     priv->num_dirties++;
@@ -1460,6 +1660,13 @@ success:
 
 fail:
     // Done
+    priv->local_writes--;
+    if (config->local_flush) {
+        pthread_cond_broadcast(&priv->unpinned);
+        pthread_cond_broadcast(&priv->write_complete);
+        pthread_cond_broadcast(&priv->space_avail);
+        pthread_cond_broadcast(&priv->worker_work);
+    }
     block_cache_op_done(priv);
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
     return r;
@@ -1598,7 +1805,7 @@ block_cache_free_entry(struct block_cache_private *priv, struct cache_entry *ent
     if ((r = s3b_dcache_erase_block(priv->dcache, entry->u.dslot)) != 0)
         (*config->log)(LOG_ERR, "can't erase cached block! %s", strerror(r));
     pthread_mutex_lock(&priv->mutex);
-    if ((r = s3b_dcache_free_block(priv->dcache, entry->u.dslot)) != 0)
+    if ((!r || !config->local_flush) && (r = s3b_dcache_free_block(priv->dcache, entry->u.dslot)) != 0)
         (*config->log)(LOG_ERR, "can't free cached block! %s", strerror(r));
     s3b_hash_remove(priv->hashtable, entry->block_num);
     block_cache_entry_free(entry);
@@ -1646,6 +1853,7 @@ block_cache_worker_main(void *arg)
         // Sanity check
         S3BCACHE_CHECK_INVARIANTS(priv, 1);
 
+        if (config->local_flush && priv->stopping && (s3b_dcache_error(priv->dcache) || priv->shutdown_error)) break;
         // Get current time
         now = block_cache_get_time(priv);
 
@@ -1669,7 +1877,9 @@ block_cache_worker_main(void *arg)
         adjusted_now = now + (uint32_t)(priv->dirty_timeout * (block_cache_dirty_ratio(priv) / priv->max_dirty_ratio));
 
         // See if there is a block that needs writing
-        if ((entry = TAILQ_FIRST(&priv->dirties)) != NULL && (priv->stopping || priv->draining || adjusted_now >= entry->timeout)) {
+        if ((entry = TAILQ_FIRST(&priv->dirties)) != NULL && (!config->local_flush ? (priv->stopping || priv->draining || adjusted_now >= entry->timeout)
+          : (!s3b_dcache_error(priv->dcache) && !priv->shutdown_error && (priv->stopping || priv->draining
+            || entry->timeout != READING_TIMEOUT || block_cache_dirty_ratio(priv) >= priv->max_dirty_ratio)))) {
 
             shared_held = 0;
 
@@ -1700,7 +1910,8 @@ block_cache_worker_main(void *arg)
                 entry->dirty = 1;
                 TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
                 block_cache_write_failed(priv, entry, r);
-                entry->timeout = block_cache_get_time(priv) + (priv->dirty_timeout ? priv->dirty_timeout : 1);
+                pthread_cond_broadcast(&priv->space_avail);
+                entry->timeout = config->local_flush ? READING_TIMEOUT : block_cache_get_time(priv) + (priv->dirty_timeout ? priv->dirty_timeout : 1);
                 pthread_rwlock_unlock(&entry->lock);
                 block_cache_entry_unref(priv, entry, 1);
                 block_cache_worker_wait(priv, entry);
@@ -1719,7 +1930,8 @@ block_cache_worker_main(void *arg)
 
             // Attempt to write the block
             CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
-            r = (*priv->inner->write_block)(priv->inner, entry->block_num, buf, etag, block_cache_check_cancel, priv);
+            r = config->local_flush ? s3b_dcache_error(priv->dcache) : 0;
+            if (!r) r = (*priv->inner->write_block)(priv->inner, entry->block_num, buf, etag, block_cache_check_cancel, priv);
             pthread_mutex_lock(&priv->mutex);
             S3BCACHE_CHECK_INVARIANTS(priv, 1);
 
@@ -1731,8 +1943,11 @@ block_cache_worker_main(void *arg)
                 const int canceled = r == ECONNABORTED && entry->dirty;
                 entry->dirty = 1;
                 TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
-                if (!canceled)
+                if (config->local_flush) entry->timeout = READING_TIMEOUT;
+                if (!canceled) {
                     block_cache_write_failed(priv, entry, r);
+                    if (config->local_flush && priv->draining) priv->shutdown_error = r;
+                }
                 pthread_cond_broadcast(&priv->write_complete);
                 continue;
             }
@@ -1756,6 +1971,7 @@ block_cache_worker_main(void *arg)
                     if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, etag)) != 0)
                         (*config->log)(LOG_ERR, "can't record cached block! %s", strerror(r));
                     pthread_mutex_lock(&priv->mutex);
+                    if (r && config->local_flush) { entry->dirty = 1; block_cache_write_failed(priv, entry, r); }
                     shared_held = 1;
                 }
             }
@@ -1780,7 +1996,7 @@ block_cache_worker_main(void *arg)
 
             // Block was modified while being written (WRITING2), so it stays DIRTY
             TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
-            entry->timeout = now + priv->dirty_timeout;     // update for 2nd write timing conservatively
+            entry->timeout = config->local_flush ? READING_TIMEOUT : now + priv->dirty_timeout;     // update for 2nd write timing conservatively
             pthread_cond_broadcast(&priv->write_complete);
             if (shared_held) {
                 pthread_rwlock_unlock(&entry->lock);

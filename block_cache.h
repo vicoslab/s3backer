@@ -47,6 +47,7 @@ struct block_cache_conf {
     u_int               read_ahead_trigger;
     u_int               no_verify;
     u_int               fadvise;
+    u_int               local_flush;        // FLUSH/FUA acknowledge the persistent local cache
     u_int               read_direct;        // O_DIRECT reads for pinned CLEAN cache file hits
     u_int               recover_dirty_blocks;
     u_int               perform_flush;
@@ -57,6 +58,14 @@ struct block_cache_conf {
 
 // Statistics structure for block_cache
 struct block_cache_stats {
+    u_int               local_flush;
+    u_int               drain_pid;
+    uint64_t            drain_start_ticks;
+    uint64_t            drain_requested;
+    uint64_t            drain_completed;
+    uint64_t            drain_errors;
+    int                 drain_error;
+    int                 local_error;
     u_int               initial_size;
     u_int               current_size;
     double              dirty_ratio;
@@ -74,3 +83,5 @@ extern struct s3backer_store *block_cache_create(struct block_cache_conf *config
 extern void block_cache_get_stats(struct s3backer_store *s3b, struct block_cache_stats *stats);
 extern void block_cache_clear_stats(struct s3backer_store *s3b);
 
+
+extern int block_cache_remote_drain(struct s3backer_store *s3b, long timeout);

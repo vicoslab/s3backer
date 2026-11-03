@@ -9,6 +9,7 @@
 #include "config.h"
 #include <string.h>
 #include <stdatomic.h>
+#include <sys/wait.h>
 void *test_memcpy(void *dst, const void *src, size_t n);
 #define memcpy test_memcpy
 #include "block_cache.c"
@@ -22,7 +23,7 @@ void *test_memcpy(void *dst, const void *src, size_t n);
 enum { NONE, VIA_PREAD, VIA_MEMCPY, VIA_PWRITE };
 struct gate { int kind, hold, inject; size_t len; u_int off; int armed, entered, released, held; };
 struct watch { int waits; void *last; };
-enum { OP_READ, OP_WRITE, OP_FLUSH, OP_SHUTDOWN };
+enum { OP_READ, OP_WRITE, OP_FLUSH, OP_SHUTDOWN, OP_DRAIN };
 struct op { int kind, b, gen, watched, r, done; u_int off, len; struct gate g; struct watch w; unsigned char buf[BS]; pthread_t t; };
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -32,6 +33,28 @@ static __thread struct watch *tl_watch;
 static __thread int tl_test;                    // created by this test, not a cache worker
 static atomic_uint worker_waits;
 static int disk;
+static int local_mode;
+static u_int local_max_dirty;
+static atomic_int sync_fail;
+static atomic_uint sync_calls;
+static atomic_int erase_observer, synced_marker;
+static atomic_int fsync_fail, metadata_fail, backend_fail;
+static atomic_long fail_pwrite_offset = -1;
+extern int __real_fsync(int);
+int __wrap_fsync(int fd) {
+    struct stat st; REQUIRE(fstat(fd, &st) == 0);
+    int kind = atomic_load(&fsync_fail);
+    if (kind && ((kind == 2) == !!S_ISDIR(st.st_mode))) { atomic_store(&fsync_fail, 0); errno = EIO; return -1; }
+    return __real_fsync(fd);
+}
+extern int __real_fdatasync(int);
+int __wrap_fdatasync(int fd) {
+    atomic_fetch_add(&sync_calls, 1);
+    if (atomic_exchange(&sync_fail, 0)) { errno = EIO; return -1; }
+    int r = __real_fdatasync(fd);
+    if (!r && atomic_load(&erase_observer)) { uint32_t flags; REQUIRE(pread(fd,&flags,4,84)==4); atomic_store(&synced_marker,flags); }
+    return r;
+}
 static struct s3backer_store *cache;
 static struct block_cache_private *P;
 static struct block_cache_conf cc;
@@ -126,6 +149,12 @@ ssize_t __wrap_pread(int fd, void *buf, size_t n, off_t off) {
 
 extern ssize_t __real_pwrite(int, const void *, size_t, off_t);
 ssize_t __wrap_pwrite(int fd, const void *buf, size_t n, off_t off) {
+    if (atomic_load(&erase_observer) && off==64 && n==24) {
+        const unsigned char zero[24]={0};
+        if (!memcmp(buf,zero,24)) REQUIRE(atomic_load(&synced_marker)==0);
+    }
+    if (off == atomic_load(&fail_pwrite_offset)) { atomic_store(&fail_pwrite_offset, -1); errno=EIO; return -1; }
+    if (n < BS && atomic_exchange(&metadata_fail, 0)) { errno = EIO; return -1; }
     const int e = gate_hook(VIA_PWRITE, n);
     if (e) { errno = e; return -1; }
     return __real_pwrite(fd, buf, n, off);
@@ -152,6 +181,7 @@ int __wrap_pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const s
 static void logger(int level, const char *fmt, ...) { (void)level; (void)fmt; }
 static int be_simple(struct s3backer_store *s) { (void)s; return 0; }
 static void be_destroy(struct s3backer_store *s) { (void)s; }
+static int be_token(struct s3backer_store *s, int32_t *old, int32_t value) { (void)s; (void)value; if(old) *old=0; return 0; }
 static int be_flush(struct s3backer_store *s, const s3b_block_t *b, u_int n, long t) { (void)s; (void)b; (void)n; (void)t; return 0; }
 static int be_read(struct s3backer_store *s, s3b_block_t b, void *dst, u_char *tag, const u_char *expect, int strict) {
     u_char t[MD5_DIGEST_LENGTH]; (void)s; (void)strict;
@@ -171,6 +201,7 @@ static int be_read(struct s3backer_store *s, s3b_block_t b, void *dst, u_char *t
 }
 static int be_write(struct s3backer_store *s, s3b_block_t b, const void *src, u_char *tag, check_cancel_t *cancel, void *arg) {
     (void)s; (void)cancel; (void)arg;
+    if (atomic_load(&backend_fail)) return EIO;
     int gen = src != NULL ? decode(src, b, 0, BS) : -1;
     pthread_mutex_lock(&g_mu);
     if (mixed_active && b == 0) { REQUIRE(src && memcmp(src, mixed_expected, BS) == 0); gen = 900; }
@@ -181,7 +212,7 @@ static int be_write(struct s3backer_store *s, s3b_block_t b, const void *src, u_
     return 0;
 }
 static struct s3backer_store inner = { .create_threads = be_simple, .read_block = be_read, .write_block = be_write,
-  .flush_blocks = be_flush, .shutdown = be_simple, .destroy = be_destroy };
+  .set_mount_token = be_token, .flush_blocks = be_flush, .shutdown = be_simple, .destroy = be_destroy };
 
 static void watchdog(int sig) { (void)sig; static const char msg[] = "FAIL watchdog\n"; ssize_t ignored = write(2, msg, sizeof(msg) - 1); (void)ignored; _exit(124); }
 
@@ -189,7 +220,11 @@ static void watchdog(int sig) { (void)sig; static const char msg[] = "FAIL watch
 static void open_cache2(u_int size, u_int timeout_ms, u_int protect, u_int delay, u_int ra) {
     memset(&cc, 0, sizeof(cc));
     cc.block_size = BS; cc.cache_size = size; cc.num_threads = 2; cc.timeout = timeout_ms; cc.num_protected = protect;
+    cc.max_dirty = local_max_dirty;
     cc.write_delay = delay; cc.read_ahead = ra; cc.read_ahead_trigger = ra ? 2 : 0;
+    #ifdef ML_HAS_LOCAL_FLUSH
+    cc.local_flush = local_mode;
+#endif
     cc.log = logger; cc.cache_file = getenv("S3BACKER_TEST_CACHE"); cc.perform_flush = 1; cc.recover_dirty_blocks = 1;
     disk = cc.cache_file != NULL;
     REQUIRE((cache = block_cache_create(&cc, &inner)) != NULL); P = cache->data;
@@ -225,6 +260,13 @@ static void *op_main(void *arg) {
     case OP_READ: r = o->len == BS ? cache->read_block(cache, o->b, o->buf, NULL, NULL, 0) : cache->read_block_part(cache, o->b, o->off, o->len, o->buf); break;
     case OP_WRITE: fill(o->buf, o->b, o->gen); r = cache->write_block(cache, o->b, o->buf, NULL, NULL, NULL); break;
     case OP_FLUSH: r = cache->flush_blocks(cache, NULL, 0, 0); break;
+    case OP_DRAIN:
+#ifdef ML_HAS_LOCAL_FLUSH
+        r = block_cache_remote_drain(cache,5000);
+#else
+        r = ENOSYS;
+#endif
+        break;
     case OP_SHUTDOWN: r = cache->shutdown(cache); break;
     }
     pthread_mutex_lock(&g_mu); o->r = r; o->done = 1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
@@ -922,8 +964,316 @@ static void case_ml_after_shutdown(void) {
     cache->destroy(cache); cache = NULL;
 }
 
+// Local durability tests execute the actual cache and disk-cache sources.
+static void lf_open(void) { local_mode = 1; open_cache2(8, 0, 0, 64, 0); REQUIRE(disk); }
+static void case_lf_local(void) {
+    lf_open(); write_sync(3, 501);
+    unsigned before = atomic_load(&sync_calls);
+    REQUIRE(cache->flush_blocks(cache, NULL, 0, 0) == 0);
+    REQUIRE(atomic_load(&sync_calls) > before);
+    REQUIRE(GET(bwrites[3]) == 0); REQUIRE(state_of(3) == DIRTY);
+    s3b_block_t b = 3; write_sync(3, 502);
+    REQUIRE(cache->flush_blocks(cache, &b, 1, 0) == 0);
+    nap(800); REQUIRE(GET(bwrites[3]) == 0); REQUIRE(state_of(3) == DIRTY);
+    REQUIRE(read_sync(3, 0, BS) == 502);
+}
+static void case_lf_default(void) {
+    open_cache2(8, 0, 0, 60000, 0); write_sync(3, 501);
+    REQUIRE(cache->flush_blocks(cache, NULL, 0, 0) == 0); REQUIRE(GET(bwrites[3]) == 1);
+}
+static void case_lf_sync_error(void) {
+    lf_open(); write_sync(3, 501); atomic_store(&sync_fail, 1);
+    REQUIRE(cache->flush_blocks(cache, NULL, 0, 0) == EIO);
+    REQUIRE(cache->flush_blocks(cache, NULL, 0, 0) == EIO);
+    struct op *w = writer(4, 502, 0, 0); start(w); finish(w); REQUIRE(w->r == EIO); free(w);
+    // A poisoned mount intentionally retains dirty entries; process exit simulates loss of the mount.
+    _exit(0);
+}
+static void case_lf_pwrite_error(void) {
+    lf_open(); struct op *w = writer(4, 502, 1, 0); w->g.inject = EIO;
+    start(w); finish(w); REQUIRE(w->r == EIO); REQUIRE(!has_block(4)); free(w);
+    REQUIRE(cache->flush_blocks(cache, NULL, 0, 0) == EIO); _exit(0);
+}
+static void case_lf_drain(void) {
+    lf_open(); write_sync(3, 501);
+#ifdef ML_HAS_LOCAL_FLUSH
+    REQUIRE(block_cache_remote_drain(cache, 5000) == 0);
+#else
+    REQUIRE(0 && "local drain API absent");
+#endif
+    REQUIRE(GET(bwrites[3]) == 1); REQUIRE(GET(bgen[3]) == 501);
+}
+static void case_lf_pending(void) {
+    lf_open(); struct op *w = writer(3, 501, 1, 1), *f = op_new(OP_FLUSH, 0);
+    start(w); REQUIRE(AWAIT(w->g.entered, WAIT_MS)); start(f);
+    REQUIRE(!AWAIT(f->done, 200)); release(w); finish(w); finish(f);
+    REQUIRE(w->r == 0 && f->r == 0); REQUIRE(GET(bwrites[3]) == 0); free(w); free(f);
+}
+
+static void case_lf_signal(void) {
+    lf_open(); write_sync(3, 505); struct block_cache_stats st;
+    REQUIRE(kill(getpid(), SIGUSR1) == 0);
+    for (int i=0; i<WAIT_MS; i+=5) { block_cache_get_stats(cache, &st);
+#ifdef ML_HAS_LOCAL_FLUSH
+        if (st.drain_completed) break;
+#endif
+        nap(5);
+    }
+#ifdef ML_HAS_LOCAL_FLUSH
+    REQUIRE(st.local_flush && st.drain_pid == (u_int)getpid());
+    REQUIRE(st.drain_requested == 1 && st.drain_completed == 1 && st.drain_error == 0);
+    block_cache_clear_stats(cache); block_cache_get_stats(cache, &st); REQUIRE(st.drain_completed == 1);
+#else
+    REQUIRE(0);
+#endif
+    REQUIRE(GET(bgen[3]) == 505);
+}
+static void case_lf_drain_error(void) {
+    lf_open(); write_sync(3, 505); atomic_store(&backend_fail, 1);
+#ifdef ML_HAS_LOCAL_FLUSH
+    REQUIRE(block_cache_remote_drain(cache, 5000) == EIO);
+    struct block_cache_stats st; block_cache_get_stats(cache, &st);
+    REQUIRE(st.drain_completed == 1 && st.drain_error == EIO);
+#else
+    REQUIRE(0);
+#endif
+    REQUIRE(cache->flush_blocks(cache, NULL, 0, 0) == 0);
+    atomic_store(&backend_fail, 0);
+}
+static void case_lf_shutdown_error(void) {
+    lf_open(); write_sync(3, 505); atomic_store(&backend_fail, 1);
+    REQUIRE(cache->shutdown(cache) == EIO); cache->destroy(cache); cache = NULL;
+    int fd=open(getenv("S3BACKER_TEST_CACHE"),O_RDONLY); uint32_t flags=0;
+    REQUIRE(fd>=0 && pread(fd,&flags,4,24)==4); REQUIRE(flags & 2); close(fd);
+}
+static void case_lf_pressure(void) {
+    lf_open(); for (int b=0;b<7;b++) write_sync(b, 500+b);
+    for (int b=0;b<7;b++) REQUIRE(GET(bwrites[b])==0);
+    write_sync(7,507); write_sync(8,508);
+    REQUIRE(read_sync(8,0,BS)==508); int n=0; for(int b=0;b<8;b++) n+=GET(bwrites[b]); REQUIRE(n>0);
+}
+static void case_lf_metadata_error(void) {
+    lf_open(); atomic_store(&metadata_fail,1); struct op *w=writer(3,505,0,0); start(w); finish(w);
+    REQUIRE(w->r==EIO && !has_block(3)); free(w); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==EIO); _exit(0);
+}
+static void case_lf_create_error(void) {
+#ifdef ML_HAS_LOCAL_FLUSH
+    struct block_cache_conf c={.block_size=BS,.cache_size=8,.num_threads=2,.local_flush=1,.recover_dirty_blocks=1,.perform_flush=1,.cache_file=getenv("S3BACKER_TEST_CACHE"),.log=logger};
+    atomic_store(&fsync_fail,1); errno=0; REQUIRE(block_cache_create(&c,&inner)==NULL && errno==EIO);
+    atomic_store(&fsync_fail,2); errno=0; REQUIRE(block_cache_create(&c,&inner)==NULL && errno==EIO);
+#else
+    REQUIRE(0);
+#endif
+}
+static void case_lf_invalid(void) {
+#ifdef ML_HAS_LOCAL_FLUSH
+    struct block_cache_conf c={.block_size=BS,.cache_size=8,.num_threads=2,.local_flush=1,.recover_dirty_blocks=1,.log=logger};
+    REQUIRE(block_cache_create(&c,&inner)==NULL && errno==EINVAL);
+    c.cache_file=getenv("S3BACKER_TEST_CACHE"); c.recover_dirty_blocks=0;
+    REQUIRE(block_cache_create(&c,&inner)==NULL && errno==EINVAL); c.recover_dirty_blocks=1; c.no_verify=1;
+    REQUIRE(block_cache_create(&c,&inner)==NULL && errno==EINVAL); c.no_verify=0; c.synchronous=1;
+    REQUIRE(block_cache_create(&c,&inner)==NULL && errno==EINVAL);
+#else
+    REQUIRE(0);
+#endif
+}
+static void case_lf_crash(void) {
+    int fds[2], status; REQUIRE(pipe(fds)==0); pid_t child=fork(); REQUIRE(child>=0);
+    if (!child) {
+        close(fds[0]); lf_open(); warm(2); write_sync(2,601); write_sync(3,602);
+        REQUIRE(cache->flush_blocks(cache,NULL,0,0)==0); write_sync(2,603);
+        unsigned char buf[BS]; fill(buf,3,604);
+        REQUIRE(cache->write_block_part(cache,3,512,1024,buf+512)==0);
+        REQUIRE(cache->flush_blocks(cache,NULL,0,0)==0); REQUIRE(write(fds[1],"!",1)==1);
+        for (;;) pause();
+    }
+    close(fds[1]); char ack; REQUIRE(read(fds[0],&ack,1)==1); close(fds[0]);
+    REQUIRE(kill(child,SIGKILL)==0 && waitpid(child,&status,0)==child && WIFSIGNALED(status));
+#ifdef ML_HAS_LOCAL_FLUSH
+    struct block_cache_conf c={.block_size=BS,.cache_size=8,.num_threads=2,.recover_dirty_blocks=1,.log=logger,.cache_file=getenv("S3BACKER_TEST_CACHE")};
+    struct s3backer_store *bad=block_cache_create(&c,&inner); REQUIRE(!bad && errno==EBUSY);
+#endif
+    lf_open(); REQUIRE(read_sync(2,0,BS)==603);
+    REQUIRE(read_sync(3,0,512)==602); REQUIRE(read_sync(3,512,1024)==604); REQUIRE(read_sync(3,1536,BS-1536)==602);
+    nap(300); REQUIRE(GET(bwrites[2])==0 && GET(bwrites[3])==0);
+    // Mixed partial payload is intentionally not passed to generation-only backend: simulate a second crash.
+    _exit(0);
+}
+// Enumerate every byte-prefix tear of an invalid miss identity in sector-straddling slot 18.
+// Payload deliberately belongs to block 7, identity to block 9: no tear may publish either as DIRTY.
+static int tear_visits;
+static int tear_visit(void *arg,s3b_block_t slot,s3b_block_t block,const u_char *tag) { (void)arg;(void)slot;(void)block;(void)tag; tear_visits++; return 0; }
+static void case_lf_identity_tears(void) {
+#ifdef ML_HAS_LOCAL_FLUSH
+    struct block_cache_conf c={.block_size=BS,.cache_size=32,.num_threads=2,.local_flush=1,.recover_dirty_blocks=1,.perform_flush=1,.log=logger,.cache_file=getenv("S3BACKER_TEST_CACHE")};
+    for(int prefix=0;prefix<=24;prefix++) {
+        unlink(c.cache_file); struct s3b_dcache *d; REQUIRE(s3b_dcache_open(&d,&c,tear_visit,NULL,1)==0);
+        unsigned char rec[24], zero[24]={0}, buf[BS]; fill(buf,7,800);
+        REQUIRE(s3b_dcache_reserve(d,18,9)==0);
+        REQUIRE(s3b_dcache_write_block(d,18,buf,0,BS)==0);
+        s3b_dcache_close(d); int fd=open(c.cache_file,O_RDWR); REQUIRE(fd>=0);
+        REQUIRE(pread(fd,rec,24,64+18*24)==24); // actual reserve record, no invented producer
+        REQUIRE(pwrite(fd,zero,24,64+18*24)==24);
+        REQUIRE(pwrite(fd,rec,prefix,64+18*24)==prefix); REQUIRE(fdatasync(fd)==0); close(fd);
+        tear_visits=0; REQUIRE(s3b_dcache_open(&d,&c,tear_visit,NULL,1)==0); REQUIRE(tear_visits==0); s3b_dcache_close(d);
+    }
+#else
+    REQUIRE(0);
+#endif
+}
+
+static void case_lf_marker_error(void) {
+    lf_open(); warm(3); atomic_store(&fail_pwrite_offset, 64+20);
+    struct op *w=writer(3,505,0,0); start(w); finish(w); REQUIRE(w->r==EIO); free(w);
+    REQUIRE(cache->flush_blocks(cache,NULL,0,0)==EIO); _exit(0);
+}
+static void case_lf_header_error(void) {
+#ifdef ML_HAS_LOCAL_FLUSH
+    struct block_cache_conf c={.block_size=BS,.cache_size=8,.num_threads=2,.recover_dirty_blocks=1,.log=logger,.cache_file=getenv("S3BACKER_TEST_CACHE")};
+    struct s3b_dcache *d; REQUIRE(s3b_dcache_open(&d,&c,tear_visit,NULL,1)==0); s3b_dcache_close(d);
+    c.local_flush=1; atomic_store(&fail_pwrite_offset,24); REQUIRE(s3b_dcache_open(&d,&c,tear_visit,NULL,1)==EIO);
+#else
+    REQUIRE(0);
+#endif
+}
+static void case_lf_clean2_write(void) {
+    lf_open(); warm(3); close_cache();
+    int fd=open(getenv("S3BACKER_TEST_CACHE"),O_RDWR); uint32_t stale=0;
+    REQUIRE(fd>=0 && pwrite(fd,&stale,4,64)==4 && fdatasync(fd)==0); close(fd);
+    lf_open(); REQUIRE(state_of(0)==CLEAN2); int before=GET(breads[0]); write_sync(0,700);
+    REQUIRE(GET(breads[0])==before+1); REQUIRE(read_sync(0,0,BS)==700);
+}
+static void case_lf_sync_concurrent(void) {
+    lf_open(); write_sync(3,505); atomic_store(&sync_fail,1);
+    struct op *a=op_new(OP_FLUSH,0), *b=op_new(OP_FLUSH,0); start(a); start(b); finish(a); finish(b);
+    REQUIRE(a->r==EIO && b->r==EIO); free(a); free(b); _exit(0);
+}
+static void case_lf_reopen_gates(void) {
+#ifdef ML_HAS_LOCAL_FLUSH
+    lf_open(); write_sync(3,505); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==0);
+    REQUIRE(cache->shutdown(cache)==0); cache->destroy(cache); cache=NULL;
+    struct block_cache_conf c=cc; struct s3b_dcache *d;
+    c.local_flush=0; REQUIRE(s3b_dcache_open(&d,&c,tear_visit,NULL,0)==EBUSY);
+    c.local_flush=1; c.recover_dirty_blocks=0; REQUIRE(s3b_dcache_open(&d,&c,tear_visit,NULL,0)==EBUSY);
+    c.recover_dirty_blocks=1; c.cache_size=9; REQUIRE(s3b_dcache_open(&d,&c,tear_visit,NULL,1)==EINVAL);
+    c.cache_size=8; REQUIRE(s3b_dcache_open(&d,&c,tear_visit,NULL,0)==0); s3b_dcache_close(d); // all entries are now clean
+#else
+    REQUIRE(0);
+#endif
+}
+
+static void case_lf_erase_order(void) {
+    lf_open(); write_sync(3,505); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==0);
+    atomic_store(&erase_observer,1); REQUIRE(s3b_dcache_fsync(P->dcache)==0); REQUIRE(atomic_load(&synced_marker)==1);
+    u_char tag[16]; etag_of(tag,3,505); REQUIRE(s3b_dcache_record_block(P->dcache,0,3,tag)==0);
+    REQUIRE(s3b_dcache_erase_block(P->dcache,0)==0); atomic_store(&erase_observer,0);
+    // Direct directory experiment has retired its entry; do not use the live hash again.
+    _exit(0);
+}
+static void case_lf_generation(void) {
+    lf_open(); wgate_open(1); write_sync(1,700);
+    struct op *f=op_new(OP_DRAIN,0); start(f); REQUIRE(AWAIT(wgate_entered>=1,WAIT_MS));
+    write_sync(1,701); REQUIRE(state_of(1)==WRITING2); REQUIRE(read_sync(1,0,BS)==701);
+    REQUIRE(cache->flush_blocks(cache,NULL,0,0)==0); wgate_release(); finish(f); REQUIRE(f->r==0); free(f);
+    REQUIRE(GET(bgen[1])==701 && GET(bwrites[1])==2 && state_of(1)==CLEAN);
+}
+static void case_lf_shutdown_pending(void) { local_mode=1; case_ml_shutdown_pending_write(); }
+static void case_lf_stress(void) {
+    lf_open(); struct worker_arg r[6], w[2], f;
+    for(int b=0;b<SB;b++){ atomic_store(&started_gen[b],bgen[b]); atomic_store(&done_gen[b],bgen[b]); }
+    for(int i=0;i<6;i++){ r[i].id=i; r[i].seed=1000+i; REQUIRE(pthread_create(&r[i].t,NULL,stress_reader,&r[i])==0); }
+    for(int i=0;i<2;i++){ w[i].id=i; w[i].seed=2000+i; REQUIRE(pthread_create(&w[i].t,NULL,stress_writer,&w[i])==0); }
+    REQUIRE(pthread_create(&f.t,NULL,stress_flusher,NULL)==0);
+    for(int i=0;i<6;i++) REQUIRE(pthread_join(r[i].t,NULL)==0);
+    for(int i=0;i<2;i++) REQUIRE(pthread_join(w[i].t,NULL)==0);
+    REQUIRE(pthread_join(f.t,NULL)==0);
+#ifdef ML_HAS_LOCAL_FLUSH
+    REQUIRE(block_cache_remote_drain(cache,5000)==0);
+#else
+    REQUIRE(0);
+#endif
+    for(int b=0;b<SB;b++) REQUIRE(GET(bgen[b])==atomic_load(&done_gen[b]));
+}
+
+static void case_lf_read_miss_error(void) {
+    lf_open(); struct op *r=reader(3,0,BS,0,0); r->g.kind=VIA_PWRITE; r->g.len=BS; r->g.armed=1; r->g.inject=EIO;
+    start(r); finish(r); REQUIRE(r->r==EIO && !has_block(3)); free(r);
+    REQUIRE(s3b_dcache_size(P->dcache)==1); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==EIO); _exit(0);
+}
+static void case_lf_erase_error(void) {
+    lf_open(); for(int b=0;b<8;b++) warm(b); atomic_store(&fail_pwrite_offset,84);
+    struct op *w=writer(9,505,0,0); start(w); finish(w); REQUIRE(w->r==EIO && !has_block(9)); free(w);
+    REQUIRE(s3b_dcache_size(P->dcache)==8); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==EIO); _exit(0);
+}
+static void case_lf_clean_migration(void) {
+    lf_open(); write_sync(3,505); REQUIRE(cache->shutdown(cache)==0);
+    REQUIRE(cache->set_mount_token(cache,NULL,0)==0); cache->destroy(cache); cache=NULL;
+    int fd=open(getenv("S3BACKER_TEST_CACHE"),O_RDONLY); uint32_t flags=0;
+    REQUIRE(fd>=0 && pread(fd,&flags,4,24)==4); REQUIRE(flags==1); close(fd);
+    local_mode=0; open_cache(8,0,0); REQUIRE(read_sync(3,0,BS)==505);
+}
+
+static void case_lf_maxdirty(void) {
+    local_max_dirty=2; lf_open(); write_sync(0,700); REQUIRE(GET(bwrites[0])==0);
+    write_sync(1,701); write_sync(2,702); REQUIRE(read_sync(2,0,BS)==702);
+    REQUIRE(GET(bwrites[0])+GET(bwrites[1])>0);
+}
+static void case_lf_slot_reuse(void) {
+    local_mode=1; open_cache(3,0,0);
+    for(int pass=0;pass<3;pass++) for(int b=0;b<8;b++) {
+        write_sync(b,1000+10*pass+b);
+#ifdef ML_HAS_LOCAL_FLUSH
+        REQUIRE(block_cache_remote_drain(cache,5000)==0);
+#else
+        REQUIRE(0);
+#endif
+    }
+    for(int b=0;b<8;b++) REQUIRE(read_sync(b,0,BS)==1020+b);
+    close_cache(); open_cache(3,0,0); for(int b=0;b<8;b++) REQUIRE(read_sync(b,0,BS)==1020+b);
+}
+
+static void case_lf_helper(void) {
+#ifdef ML_HAS_LOCAL_FLUSH
+    lf_open(); write_sync(3,777);
+    char path[4096], temp[4096], lock[4096];
+    REQUIRE(snprintf(path,sizeof(path),"%s.stats",cc.cache_file)<(int)sizeof(path));
+    REQUIRE(snprintf(temp,sizeof(temp),"%s.new",path)<(int)sizeof(temp));
+    REQUIRE(snprintf(lock,sizeof(lock),"%s.drain.lock",path)<(int)sizeof(lock));
+    pid_t child=-1; int status=0,done=0;
+    const char *helper=getenv("S3BACKER_TEST_HELPER"); REQUIRE(helper);
+    for(int i=0;i<WAIT_MS;i+=10) {
+        struct block_cache_stats st; block_cache_get_stats(cache,&st);
+        FILE *fp=fopen(temp,"w"); REQUIRE(fp);
+        fprintf(fp,"block_cache_local_flush %u\nblock_cache_drain_pid %u\nblock_cache_drain_start_ticks %ju\nblock_cache_drain_requested %ju\nblock_cache_drain_completed %ju\nblock_cache_drain_errors %ju\nblock_cache_drain_error %d\nblock_cache_local_error %d\nblock_cache_read_hit_ratio 0.5\n",
+          st.local_flush,st.drain_pid,(uintmax_t)st.drain_start_ticks,(uintmax_t)st.drain_requested,
+          (uintmax_t)st.drain_completed,(uintmax_t)st.drain_errors,st.drain_error,st.local_error);
+        REQUIRE(fclose(fp)==0 && rename(temp,path)==0);
+        if(child<0) { child=fork(); REQUIRE(child>=0); if(!child) { execl("/usr/bin/python3","python3",helper,path,"--timeout","3",(char*)NULL); _exit(127); } }
+        if(waitpid(child,&status,WNOHANG)==child) { done=1; break; }
+        nap(10);
+    }
+    if(!done) { kill(child,SIGKILL); waitpid(child,&status,0); }
+    REQUIRE(done && WIFEXITED(status) && WEXITSTATUS(status)==0); REQUIRE(GET(bgen[3])==777);
+    unlink(path); unlink(temp); unlink(lock);
+#else
+    REQUIRE(0);
+#endif
+}
+
 int main(int argc, char **argv) {
     static const struct { const char *name; void (*fn)(void); } cases[] = {
+        { "lf-helper", case_lf_helper },
+        { "lf-maxdirty", case_lf_maxdirty }, { "lf-slot-reuse", case_lf_slot_reuse },
+        { "lf-read-miss-error", case_lf_read_miss_error }, { "lf-erase-error", case_lf_erase_error }, { "lf-clean-migration", case_lf_clean_migration },
+        { "lf-erase-order", case_lf_erase_order }, { "lf-generation", case_lf_generation },
+        { "lf-shutdown-pending", case_lf_shutdown_pending }, { "lf-stress", case_lf_stress },
+        { "lf-marker-error", case_lf_marker_error }, { "lf-header-error", case_lf_header_error }, { "lf-clean2-write", case_lf_clean2_write },
+        { "lf-sync-concurrent", case_lf_sync_concurrent }, { "lf-reopen-gates", case_lf_reopen_gates },
+        { "lf-signal", case_lf_signal }, { "lf-drain-error", case_lf_drain_error }, { "lf-shutdown-error", case_lf_shutdown_error },
+        { "lf-pressure", case_lf_pressure }, { "lf-metadata-error", case_lf_metadata_error }, { "lf-create-error", case_lf_create_error },
+        { "lf-invalid", case_lf_invalid }, { "lf-crash", case_lf_crash }, { "lf-identity-tears", case_lf_identity_tears },
+        { "lf-local", case_lf_local }, { "lf-default", case_lf_default }, { "lf-sync-error", case_lf_sync_error },
+        { "lf-pwrite-error", case_lf_pwrite_error }, { "lf-drain", case_lf_drain }, { "lf-pending", case_lf_pending },
         { "partial-clean", case_partial_clean }, { "hit-overlap", case_hit_overlap }, { "same-entry", case_same_entry }, { "reader-vs-write", case_reader_vs_write },
         { "evict-pinned", case_evict_pinned }, { "timeout-pinned", case_timeout_pinned }, { "pread-error", case_pread_error },
         { "shutdown-active", case_shutdown_active }, { "worker-flush", case_worker_flush }, { "stress", case_stress },

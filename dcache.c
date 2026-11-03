@@ -78,7 +78,8 @@
 
 // Bits for file_header.flags
 #define HDRFLG_NEW_FORMAT           0x00000001
-#define HDRFLG_MASK                 0x00000001
+#define HDRFLG_LOCAL_ACK            0x00000002
+#define HDRFLG_MASK                 0x00000003
 
 // Bits for dir_entry.flags
 #define ENTFLG_DIRTY                0x00000001
@@ -127,6 +128,9 @@ struct dir_entry {
 
 // Private structure
 struct s3b_dcache {
+    u_int                           local_flush;
+    int                             sync_error;
+    pthread_mutex_t                 sync_mutex;
     int                             fd;
     log_func_t                      *log;
     char                            *filename;
@@ -182,9 +186,8 @@ static void s3b_dcache_direct_key_init(void);
 #if USE_FALLOCATE
 static int s3b_dcache_write_block_falloc(struct s3b_dcache *priv, u_int dslot, const char *src, u_int doff, u_int len);
 static u_int s3b_dcache_count_zero_fs_blocks(struct s3b_dcache *priv, const char *src, u_int len);
-#else
-static int s3b_dcache_write_block_simple(struct s3b_dcache *priv, u_int dslot, const void *src, u_int off, u_int len);
 #endif
+static int s3b_dcache_write_block_simple(struct s3b_dcache *priv, u_int dslot, const void *src, u_int off, u_int len);
 
 // Internal variables
 static const struct dir_entry zero_entry;
@@ -219,6 +222,8 @@ s3b_dcache_open(struct s3b_dcache **dcachep, struct block_cache_conf *config,
     memset(priv, 0, sizeof(*priv));
     priv->fd = -1;
     priv->dfd = -1;
+    priv->local_flush = config->local_flush;
+    pthread_mutex_init(&priv->sync_mutex, NULL);
     priv->log = config->log;
     priv->block_size = config->block_size;
     priv->max_blocks = config->cache_size;
@@ -252,7 +257,7 @@ retry:
         goto fail3;
     }
     // Validate the actual buffered descriptor before reading metadata or resizing.
-    if (config->read_direct) {
+    if (config->read_direct || config->local_flush) {
         const int fl = fcntl(priv->fd, F_GETFL);
         const int fdfl = fcntl(priv->fd, F_GETFD);
         if (!S_ISREG(sb.st_mode) || fl == -1 || fdfl == -1
@@ -336,6 +341,13 @@ retry:
         (*priv->log)(LOG_ERR, "invalid cache file \"%s\": %s", priv->filename, "unrecognized flags present");
         goto fail3;
     }
+    if ((header.flags & HDRFLG_LOCAL_ACK) && (!config->local_flush || !config->recover_dirty_blocks)) {
+        (*priv->log)(LOG_ERR, "local-ack cache requires local flush and dirty recovery; drain with its owning mount first");
+        r = EBUSY; goto fail3;
+    }
+    if (config->local_flush && (!(header.flags & HDRFLG_NEW_FORMAT) || header.max_blocks != priv->max_blocks)) {
+        r = EINVAL; goto fail3;
+    }
     priv->flags = header.flags;
 
     // Check number of blocks, shrinking or expanding if necessary
@@ -413,6 +425,12 @@ retry:
         }
     }
 
+    if (config->local_flush && visitor != NULL) {
+        uint32_t flags = priv->flags | HDRFLG_LOCAL_ACK;
+        if ((r = s3b_dcache_write(priv, offsetof(struct file_header, flags), &flags, sizeof(flags))) != 0
+          || (r = s3b_dcache_fsync(priv)) != 0) goto fail3;
+        priv->flags = flags;
+    }
     // Done
     *dcachep = priv;
     return 0;
@@ -425,6 +443,7 @@ fail2:
     free(priv->filename);
 fail1:
     free(priv->free_list);
+    pthread_mutex_destroy(&priv->sync_mutex);
     free(priv);
     return r;
 }
@@ -454,7 +473,7 @@ s3b_dcache_set_mount_token(struct s3b_dcache *priv, int32_t *old_valuep, int32_t
             return r;
 
         // Sync to disk
-        s3b_dcache_fsync(priv);
+        if ((r = s3b_dcache_fsync(priv)) != 0) return r;
     }
 
     // Done
@@ -470,6 +489,7 @@ s3b_dcache_close(struct s3b_dcache *priv)
     free(priv->filename);
     free(priv->free_list);
     pthread_mutex_destroy(&priv->size_mutex);
+    pthread_mutex_destroy(&priv->sync_mutex);
     free(priv);
 }
 
@@ -563,6 +583,14 @@ s3b_dcache_erase_block(struct s3b_dcache *priv, u_int dslot)
     // Sanity check
     assert(dslot < priv->max_blocks);
 
+    // A RAM-CLEAN entry may still have a durable DIRTY record from its last PUT.
+    // Retire that marker before erasing any identity bytes: a torn erase must
+    // never combine block_num=0 with the old DIRTY marker.
+    if (priv->local_flush) {
+        const uint32_t clean = 0;
+        if ((r = s3b_dcache_write(priv, DIR_OFFSET(priv->flags, dslot) + offsetof(struct dir_entry, flags), &clean, sizeof(clean))) != 0
+          || (r = s3b_dcache_fsync(priv)) != 0) return r;
+    }
     // Update directory
     if ((r = s3b_dcache_write_entry(priv, dslot, &zero_entry)) != 0)
         return r;
@@ -706,12 +734,12 @@ s3b_dcache_read_block_direct(struct s3b_dcache *priv, u_int dslot, void *dest, u
             }
             (*priv->log)(LOG_ERR, "error reading cache file \"%s\" at offset %ju: %s",
               priv->filename, (uintmax_t)posn, strerror(r));
-            return r;
+            return s3b_dcache_poison(priv, r);
         }
         if (n == 0) {                                           // truncated input
             (*priv->log)(LOG_ERR, "error reading cache file \"%s\" at offset %ju: file is truncated",
               priv->filename, (uintmax_t)posn);
-            return EINVAL;
+            return s3b_dcache_poison(priv, EINVAL);
         }
     }
 
@@ -752,7 +780,8 @@ s3b_dcache_write_block(struct s3b_dcache *priv, u_int dslot, const void *src, u_
 
     if (DATA_OFFSET(priv, dslot + 1) <= FILE_SIZE(priv)) {      // entirely inside the file: cannot change the file size
 #if USE_FALLOCATE
-        return s3b_dcache_write_block_falloc(priv, dslot, src, off, len);
+        return priv->local_flush ? s3b_dcache_write_block_simple(priv, dslot, src, off, len)
+          : s3b_dcache_write_block_falloc(priv, dslot, src, off, len);
 #else
         return s3b_dcache_write_block_simple(priv, dslot, src, off, len);
 #endif
@@ -771,7 +800,8 @@ s3b_dcache_write_block_extend(struct s3b_dcache *priv, u_int dslot, const void *
 
     // Write the data info the block
 #if USE_FALLOCATE
-    r = s3b_dcache_write_block_falloc(priv, dslot, src, off, len);
+    r = priv->local_flush ? s3b_dcache_write_block_simple(priv, dslot, src, off, len)
+      : s3b_dcache_write_block_falloc(priv, dslot, src, off, len);
 #else
     r = s3b_dcache_write_block_simple(priv, dslot, src, off, len);
 #endif
@@ -936,7 +966,7 @@ done:
     return num_blocks;
 }
 
-#else   /* !USE_FALLOCATE */
+#endif   /* USE_FALLOCATE */
 
 /*
  * Write data into one dslot.
@@ -966,7 +996,7 @@ s3b_dcache_write_block_simple(struct s3b_dcache *priv, u_int dslot, const void *
     return 0;
 }
 
-#endif  /* !USE_FALLOCATE */
+
 
 /*
  * Synchronize outstanding changes to persistent storage.
@@ -974,18 +1004,55 @@ s3b_dcache_write_block_simple(struct s3b_dcache *priv, u_int dslot, const void *
 int
 s3b_dcache_fsync(struct s3b_dcache *priv)
 {
-    int r;
-
+    int r = 0;
+    if (priv->local_flush) {
+        pthread_mutex_lock(&priv->sync_mutex);
+        r = s3b_dcache_error(priv);
+        if (r == 0 && fdatasync(priv->fd) == -1) {
+            r = errno;
+            __atomic_store_n(&priv->sync_error, r, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&priv->sync_mutex);
+        return r;
+    }
 #if HAVE_DECL_FDATASYNC
     r = fdatasync(priv->fd);
 #else
     r = fsync(priv->fd);
 #endif
-    if (r == -1) {
-        r = errno;
-        (*priv->log)(LOG_ERR, "error fsync'ing cache file \"%s\": %s", priv->filename, strerror(r));
-    }
+    if (r == -1)
+        (*priv->log)(LOG_ERR, "error fsync'ing cache file: %s", strerror(errno));
+    return 0;                       // preserve legacy OFF behavior
+}
+
+int s3b_dcache_error(struct s3b_dcache *priv) {
+    return priv && priv->local_flush ? __atomic_load_n(&priv->sync_error, __ATOMIC_ACQUIRE) : 0;
+}
+int s3b_dcache_poison(struct s3b_dcache *priv, int error) {
+    if (!priv->local_flush || !error) return error;
+    pthread_mutex_lock(&priv->sync_mutex);
+    if (!s3b_dcache_error(priv)) __atomic_store_n(&priv->sync_error, error, __ATOMIC_RELEASE);
+    error = s3b_dcache_error(priv);
+    pthread_mutex_unlock(&priv->sync_mutex);
+    return error;
+}
+int s3b_dcache_local_ack(struct s3b_dcache *priv) { return !!(priv->flags & HDRFLG_LOCAL_ACK); }
+int s3b_dcache_clear_local_ack(struct s3b_dcache *priv) {
+    uint32_t flags = priv->flags & ~HDRFLG_LOCAL_ACK;
+    int r;
+    if ((r = s3b_dcache_fsync(priv)) != 0) return r;
+    if ((r = s3b_dcache_write(priv, offsetof(struct file_header, flags), &flags, sizeof(flags))) != 0) return r;
+    if ((r = s3b_dcache_fsync(priv)) != 0) return r;
+    priv->flags = flags;
     return 0;
+}
+int s3b_dcache_reserve(struct s3b_dcache *priv, u_int dslot, s3b_block_t block) {
+    struct dir_entry entry = { .block_num = block };
+    return s3b_dcache_write_entry(priv, dslot, &entry);
+}
+int s3b_dcache_mark_dirty(struct s3b_dcache *priv, u_int dslot) {
+    const uint32_t dirty = ENTFLG_DIRTY;
+    return s3b_dcache_write(priv, DIR_OFFSET(priv->flags, dslot) + offsetof(struct dir_entry, flags), &dirty, sizeof(dirty));
 }
 
 // Internal functions
@@ -1203,6 +1270,15 @@ s3b_dcache_create_file(struct s3b_dcache *priv, int *fdp, const char *filename, 
         goto fail;
     }
 
+    if (priv->local_flush) {
+        char *parent = strdup(filename), *slash;
+        if (!parent) { r = errno; goto fail; }
+        slash = strrchr(parent, '/');
+        if (!slash) strcpy(parent, "."); else if (slash == parent) slash[1] = 0; else *slash = 0;
+        if (fsync(*fdp) == -1) r = errno; else r = fsync_path(parent, 1);
+        free(parent);
+        if (r != 0) { s3b_dcache_poison(priv, r); goto fail; }
+    }
     // Done
     if (headerp != NULL)
         *headerp = header;
@@ -1250,10 +1326,18 @@ s3b_dcache_init_free_list(struct s3b_dcache *priv, s3b_dcache_visit_t *visitor, 
 
             memset(&entry, 0, sizeof(entry));
             memcpy(&entry, buffer + i * DIR_ENTSIZE(priv->flags), DIR_ENTSIZE(priv->flags));
+            if (priv->local_flush && (entry.flags & ~ENTFLG_MASK)) return EINVAL;
+            if (priv->local_flush && (entry.flags & ENTFLG_DIRTY) && !(priv->flags & HDRFLG_LOCAL_ACK)) return EBUSY;
+            if (priv->local_flush && memcmp(&entry, &zero_entry, sizeof(entry)) != 0 && !(entry.flags & ENTFLG_DIRTY)
+              && memcmp(entry.etag, zero_entry.etag, MD5_DIGEST_LENGTH) == 0) {
+                if ((r = s3b_dcache_erase_block(priv, dslot)) != 0) return r;
+                memset(&entry, 0, sizeof(entry));
+            }
             if (memcmp(&entry, &zero_entry, sizeof(entry)) == 0) {
                 if ((r = s3b_dcache_push(priv, dslot)) != 0)
                     return r;
-            } else if ((entry.flags & ENTFLG_DIRTY) != 0 && !visit_dirty) {     // visitor doesn't want dirties, so just nuke it
+            } else if ((entry.flags & ENTFLG_DIRTY) != 0 && !visit_dirty) {
+                if (priv->local_flush || (priv->flags & HDRFLG_LOCAL_ACK)) return EBUSY;     // visitor doesn't want dirties, so just nuke it
                 if ((r = s3b_dcache_write_entry(priv, dslot, &zero_entry)) != 0)
                     return r;
                 if ((r = s3b_dcache_push(priv, dslot)) != 0)
@@ -1383,12 +1467,12 @@ s3b_dcache_read(struct s3b_dcache *priv, off_t offset, void *data, size_t len)
             r = errno;
             (*priv->log)(LOG_ERR, "error reading cache file \"%s\" at offset %ju: %s",
               priv->filename, (uintmax_t)posn, strerror(r));
-            return r;
+            return s3b_dcache_poison(priv, r);
         }
         if (r == 0) {           // truncated input
             (*priv->log)(LOG_ERR, "error reading cache file \"%s\" at offset %ju: file is truncated",
               priv->filename, (uintmax_t)posn);
-            return EINVAL;
+            return s3b_dcache_poison(priv, EINVAL);
         }
     }
     return 0;
@@ -1406,6 +1490,7 @@ s3b_dcache_write2(struct s3b_dcache *priv, int fd, const char *filename, off_t o
     size_t sofar;
     ssize_t r;
 
+    if (s3b_dcache_error(priv)) return s3b_dcache_error(priv);
     for (sofar = 0; sofar < len; sofar += r) {
         const off_t chunk_off = offset + sofar;
         const size_t chunk_len = len - sofar;
@@ -1414,8 +1499,9 @@ s3b_dcache_write2(struct s3b_dcache *priv, int fd, const char *filename, off_t o
             r = errno;
             (*priv->log)(LOG_ERR, "error writing cache file \"%s\" at offset %ju: %s",
               filename, (uintmax_t)chunk_off, strerror(r));
-            return r;
+            return s3b_dcache_poison(priv, r);
         }
+        if (r == 0) return s3b_dcache_poison(priv, EIO);
         if (chunk_off + chunk_len > FILE_SIZE(priv))
             __atomic_store_n(&priv->file_size, chunk_off + chunk_len, __ATOMIC_RELEASE);
     }

@@ -58,6 +58,12 @@ s3backer_reset(struct s3b_config *config)
     if (!config->quiet)
         warnx("resetting mount token for %s", config->description);
 
+    // Refuse retained local acknowledgements before changing either resource's token.
+    if (config->block_cache.cache_file && stat(config->block_cache.cache_file, &cache_file_stat) == 0) {
+        if ((r = s3b_dcache_open(&dcache, &config->block_cache, NULL, NULL, 0)) != 0) goto fail;
+        if (s3b_dcache_local_ack(dcache)) { warnx("local-ack cache must be drained before reset"); goto fail; }
+        s3b_dcache_close(dcache); dcache = NULL;
+    }
     // Create temporary lower layer
     if ((s3b = config->test ? test_io_create(&config->test_io) : http_io_create(&config->http_io)) == NULL) {
         warnx(config->test ? "test_io_create" : "http_io_create");
@@ -80,6 +86,7 @@ s3backer_reset(struct s3b_config *config)
         } else {
             if ((r = s3b_dcache_open(&dcache, &config->block_cache, NULL, NULL, 0)) != 0)
                 warnx("error opening cache file \"%s\": %s", config->block_cache.cache_file, strerror(r));
+            if (r != 0) goto fail;
             if ((r = s3b_dcache_set_mount_token(dcache, NULL, 0)) != 0)
                 warnx("error reading mount token from \"%s\": %s", config->block_cache.cache_file, strerror(r));
         }

@@ -76,3 +76,10 @@ extern void s3b_dcache_get_direct_stats(struct s3b_dcache *priv, struct s3b_dcac
 
 
 extern void s3b_dcache_get_direct_memory_stats(size_t *bytes, size_t *buffers, size_t *peak);
+
+extern int s3b_dcache_error(struct s3b_dcache *priv);
+extern int s3b_dcache_poison(struct s3b_dcache *priv, int error);
+extern int s3b_dcache_local_ack(struct s3b_dcache *priv);
+extern int s3b_dcache_clear_local_ack(struct s3b_dcache *priv);
+extern int s3b_dcache_reserve(struct s3b_dcache *priv, u_int dslot, s3b_block_t block);
+extern int s3b_dcache_mark_dirty(struct s3b_dcache *priv, u_int dslot);

@@ -373,6 +373,11 @@ static const struct fuse_opt option_list[] = {
         .value=     1
     },
     {
+        .templ=     "--blockCacheLocalFlush",
+        .offset=    offsetof(struct s3b_config, block_cache.local_flush),
+        .value=     1
+    },
+    {
         .templ=     "--blockCacheReadDirect",
         .offset=    offsetof(struct s3b_config, block_cache.read_direct),
         .value=     1
@@ -767,6 +772,7 @@ s3backer_get_config2(int argc, char **argv, int nbd, int parse_only, fuse_opt_pr
             "blockCacheFile",
             "blockCacheNoVerify",
             "blockCacheFileAdvise",
+            "blockCacheLocalFlush",
             "blockCacheReadDirect",
             "minWriteDelay",
             "md5CacheSize",
@@ -1122,6 +1128,9 @@ s3b_config_print_stats(void *prarg, printer_t *printer)
         u_int total_reads;
         u_int total_writes;
 
+        (*printer)(prarg, "block_cache_local_flush %u\nblock_cache_drain_pid %u\nblock_cache_drain_start_ticks %ju\nblock_cache_drain_requested %ju\nblock_cache_drain_completed %ju\nblock_cache_drain_errors %ju\nblock_cache_drain_error %d\nblock_cache_local_error %d\n",
+          block_cache_stats.local_flush, block_cache_stats.drain_pid, (uintmax_t)block_cache_stats.drain_start_ticks, (uintmax_t)block_cache_stats.drain_requested,
+          (uintmax_t)block_cache_stats.drain_completed, (uintmax_t)block_cache_stats.drain_errors, block_cache_stats.drain_error, block_cache_stats.local_error);
         total_reads = block_cache_stats.read_hits + block_cache_stats.read_misses;
         if (total_reads != 0)
             read_hit_ratio = (double)block_cache_stats.read_hits / (double)total_reads;
@@ -1758,6 +1767,12 @@ validate_config(int parse_only)
         }
     }
 
+    if (config.block_cache.local_flush && (!config.block_cache.cache_file || !config.block_cache.cache_size
+      || !config.block_cache.recover_dirty_blocks || config.block_cache.no_verify || config.block_cache.synchronous
+      || config.force || config.reset || config.shared_disk_mode)) {
+        warnx("--blockCacheLocalFlush requires persistent FILE cache, recovery and verification; conflicts with sync, force, reset and shared mode");
+        return -1;
+    }
     // Check block cache config
     if (config.block_cache.cache_size > 0 && config.block_cache.num_threads <= 0) {
         warnx("invalid block cache thread pool size %u", config.block_cache.num_threads);
@@ -2061,6 +2076,7 @@ validate_config(int parse_only)
             int32_t cache_mount_token = -1;
             struct stat cache_file_stat;
             struct s3b_dcache *dcache;
+            int local_ack = 0;
 
             // Open disk cache file, if any, and read the mount token therein, if any
             if (stat(config.block_cache.cache_file, &cache_file_stat) == -1) {
@@ -2071,9 +2087,12 @@ validate_config(int parse_only)
                     errx(1, "error opening cache file \"%s\": %s", config.block_cache.cache_file, strerror(r));
                 if (s3b_dcache_has_mount_token(dcache) && (r = s3b_dcache_set_mount_token(dcache, &cache_mount_token, -1)) != 0)
                     errx(1, "error reading mount token from \"%s\": %s", config.block_cache.cache_file, strerror(r));
+                local_ack = s3b_dcache_local_ack(dcache);
                 s3b_dcache_close(dcache);
             }
 
+            if (local_ack && cache_mount_token != mount_token)
+                errx(1, "local-ack cache token mismatch: preserve cache and reconcile ownership before recovery");
             // If cache file is older format, then cache_mount_token will be -1, otherwise >= 0
             if (cache_mount_token > 0) {
 
@@ -2229,6 +2248,7 @@ usage(void)
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheMaxDirty=NUM", "Block cache maximum number of dirty blocks");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheNoVerify", "Disable verification of data loaded from cache file");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheFileAdvise", "Use posix_fadvise(2) after reading from cache file");
+    fprintf(stderr, "\t--%-27s %s\n", "blockCacheLocalFlush", "Acknowledge FLUSH/FUA in persistent local cache (default off)");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheReadDirect", "Use O_DIRECT for pinned clean cache file hits");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheSize=NUM", "Block cache size (in number of blocks)");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheSync", "Block cache performs all writes synchronously");

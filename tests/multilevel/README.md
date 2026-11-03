@@ -21,3 +21,11 @@ build the working tree. Expected: baseline fails the ten RED `ml-*` cases (`ml-d
 `ml-reader-vs-write`, `ml-snapshot`, `ml-flush-pending-write`, `ml-shutdown-pending-write`, `ml-evict-gate`) on commit 444f902; the candidate passes everything except the
 three superseded unmodified baseline cases per mode (reported under `pins-superseded/`, expected to fail). `ml-late-write-hit`, `ml-late-write-miss` and `ml-read-owner`
 are the shutdown-admission regressions: `ml-late-write-*` fail on the earlier two-level commit a1d7663 (they pass on 444f902), `ml-read-owner` fails on both. TSan startup retries are bounded and recorded separately from successful test executions. The multilevel harness emits a flushed `TEST-START` marker; legacy harnesses without that marker leave some crash-at-startup classifications unverified. Preserve those attempts and any exhausted cells as non-passes, not evidence of flawless sanitizer operation. Reported races and actual test failures are not retried. See [the validation record](../../docs/multilevel-validation.md) for the observed counts and limitations.
+
+The `local` suite extends the real C harness for opt-in persistent local FLUSH.
+It link-wraps fdatasync/fsync/pwrite for errors and barrier observation, exercises
+SIGUSR1 and request/completion stats, pressure, sticky failures, SIGKILL/reopen
+with known dirty rewrite/partial patterns, invalid identity byte-prefix images,
+and marker-before-erase ordering. Absent features fail assertions (never skip).
+Run with `--variants cand-assert,cand-asan,cand-tsan,cand-opt --suites local`.
+TSan receives exactly one attempt; environment startup failures remain failures.

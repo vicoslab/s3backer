@@ -14,7 +14,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 BASE = HERE / 'baseline'
 SOURCES = 'nbdkit block_cache block_part dcache ec_protect zero_cache erase fuse_ops hash util compress http_io reset s3b_config test_io sslcompat gitrev'.split()
-WRAPS = ['pread', 'pwrite', 'pthread_cond_wait', 'pthread_cond_timedwait', 'pthread_rwlock_rdlock', 'pthread_rwlock_wrlock']
+WRAPS = ['fsync', 'fdatasync', 'pread', 'pwrite', 'pthread_cond_wait', 'pthread_cond_timedwait', 'pthread_rwlock_rdlock', 'pthread_rwlock_wrlock']
 ML_CASES = ['ml-dirty-read-same', 'ml-dirty-read-diff', 'ml-write-overlap-dirty', 'ml-write-overlap-clean', 'ml-same-block-excl', 'ml-reader-vs-write',
             'ml-writer-progress', 'ml-snapshot', 'ml-flush-pending-write', 'ml-shutdown-pending-write', 'ml-upload-rewrite', 'ml-singleflight',
             'ml-fill-error', 'ml-readahead', 'ml-evict-gate', 'ml-full-dirty', 'ml-clean2-shared', 'ml-pwrite-error', 'ml-snapshot-error', 'ml-restart',
@@ -86,6 +86,7 @@ def main():
         cflags, lflags, renv = (san if san else ([], [], {}))
         flags = [a.cc, '-std=gnu11', '-O2', '-g', '-march=x86-64', '-mtune=generic', '-fPIC', '-ffunction-sections', '-fdata-sections', '-pthread', *cflags,
                  f'-I{src}', f'-I{HERE}', f'-I{deps}/include', f'-I{deps}/include/x86_64-linux-gnu', f'-I{deps}/include/fuse3'] + (['-DREAD_PINS_CANDIDATE'] + (['-DMULTILEVEL_CANDIDATE'] if cand else []) + (['-DML_HAS_DRAINING'] if 'draining' in (src / 'block_cache.c').read_text() else []))
+        if 'local_flush' in (src / 'block_cache.h').read_text(): flags += ['-DML_HAS_LOCAL_FLUSH']
         libs = [f'-L{lib}', f'-Wl,-rpath,{lib}', '-lfuse3', '-lexpat', '-lcrypto', '-lcurl', '-lz']
         W = lambda *ws: [f'-Wl,--wrap={w}' for w in ws]
         COND = ['pthread_cond_wait', 'pthread_cond_timedwait']
@@ -127,6 +128,9 @@ def main():
         def add(binary, case, label, use_disk):
             if only and case not in only: return
             jobs.append((b / binary, case, label, use_disk))
+        if 'local' in suites:
+            for c in ['lf-local', 'lf-default', 'lf-sync-error', 'lf-pwrite-error', 'lf-drain', 'lf-pending', 'lf-signal', 'lf-drain-error', 'lf-shutdown-error', 'lf-pressure', 'lf-metadata-error', 'lf-create-error', 'lf-invalid', 'lf-crash', 'lf-identity-tears', 'lf-marker-error', 'lf-header-error', 'lf-clean2-write', 'lf-sync-concurrent', 'lf-reopen-gates', 'lf-erase-order', 'lf-generation', 'lf-shutdown-pending', 'lf-stress', 'lf-read-miss-error', 'lf-erase-error', 'lf-clean-migration', 'lf-maxdirty', 'lf-slot-reuse', 'lf-helper']:
+                add('ml-test', c, f'local/disk/{c}', True)
         if 'ml' in suites:
             for c in ML_CASES:
                 if c not in DISK_ONLY: add('ml-test', c, f'ml/memory/{c}', False)
@@ -154,6 +158,7 @@ def main():
             attempts = 0; bases = []
             while True:
                 attempts += 1; tenv = dict(env, **renv); cache = None
+                tenv["S3BACKER_TEST_HELPER"] = str(REPO / "tools/local-cache-drain.py")
                 if use_disk:
                     cache = b / (label.replace('/', '_') + f'.{attempts}.cache'); cache.unlink(missing_ok=True); tenv['S3BACKER_TEST_CACHE'] = str(cache)
                 try:
@@ -177,7 +182,7 @@ def main():
                     elif crashed and not has_marker and not reported: basis = 'no-start-marker' if pathlib.Path(binary).name.startswith('ml-test') else 'unverified-no-marker'
                 startup = basis is not None
                 bases.append(basis)
-                if startup and attempts < 12: continue
+                # One attempt: retain actual sanitizer environment failures.
                 break
             return label, {'exit': code, 'attempts': attempts, 'startup_failure': startup, 'startup_attempt_basis': [x for x in bases if x],
                            'sanitizer_report': any(m in text for m in ['WARNING: ThreadSanitizer', 'ERROR: AddressSanitizer', 'runtime error:']),

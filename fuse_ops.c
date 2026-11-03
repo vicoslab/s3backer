@@ -533,6 +533,7 @@ fuse_op_flush(const char *path, struct fuse_file_info *fi)
 static int
 fuse_op_fsync(const char *path, int isdatasync, struct fuse_file_info *fi)
 {
+    if (config->s3bconf->block_cache.local_flush) return fuse_op_flush(path, fi);
     return 0;
 }
 
