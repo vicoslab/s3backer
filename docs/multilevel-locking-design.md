@@ -13,7 +13,7 @@ Every payload copy is therefore up to 16 MiB, and holding the one mutex `priv->m
 > Deviations from this design: the per-entry lock is a standard `pthread_rwlock_t` (glibc writer preference), not the
 > custom phase-fair lock; the entry state encoding is unchanged (no explicit `state`, no `DEAD`, no `loaded`); eviction
 > in disk mode parks the victim as READING instead of recycling its struct; a new full-block write publishes a READING
-> entry while the payload is written; shutdown waits for in-flight writes (`pending_writes`). Sections 3-6 below are
+> entry while the payload is written; shutdown stops admission and drains admitted requests (`draining`/`active_ops`). Sections 3-6 below are
 > the original proposal and are kept for review history only.
 
 ## 1. What currently runs under the global mutex (G)

@@ -18,6 +18,7 @@ Native C regressions for two-level block-cache locking. They compile the real `b
 
 Environment fallbacks: `S3B_DEPS`, `S3B_GUEST_FUSE`, `S3B_CC`. `--out` must not exist. Baseline variants build `git archive <base-commit>`; candidate variants
 build the working tree. Expected: baseline fails the ten RED `ml-*` cases (`ml-dirty-read-*`, `ml-write-overlap-*`, `ml-same-block-excl`,
-`ml-reader-vs-write`, `ml-snapshot`, `ml-flush-pending-write`, `ml-shutdown-pending-write`, `ml-evict-gate`); the candidate passes everything except the
-two superseded unmodified baseline cases (reported under `pins-superseded/`). TSAN startup crashes caused by address-space randomization are retried
+`ml-reader-vs-write`, `ml-snapshot`, `ml-flush-pending-write`, `ml-shutdown-pending-write`, `ml-evict-gate`) on commit 444f902; the candidate passes everything except the
+three superseded unmodified baseline cases per mode (reported under `pins-superseded/`, expected to fail). `ml-late-write-hit`, `ml-late-write-miss` and `ml-read-owner`
+are the shutdown-admission regressions: `ml-late-write-*` fail on the earlier two-level commit a1d7663 (they pass on 444f902), `ml-read-owner` fails on both. TSAN startup crashes caused by address-space randomization are retried
 only when the process printed nothing; a sanitizer report or test failure is never retried.

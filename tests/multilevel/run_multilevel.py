@@ -18,7 +18,7 @@ WRAPS = ['pread', 'pwrite', 'pthread_cond_wait', 'pthread_cond_timedwait', 'pthr
 ML_CASES = ['ml-dirty-read-same', 'ml-dirty-read-diff', 'ml-write-overlap-dirty', 'ml-write-overlap-clean', 'ml-same-block-excl', 'ml-reader-vs-write',
             'ml-writer-progress', 'ml-snapshot', 'ml-flush-pending-write', 'ml-shutdown-pending-write', 'ml-upload-rewrite', 'ml-singleflight',
             'ml-fill-error', 'ml-readahead', 'ml-evict-gate', 'ml-full-dirty', 'ml-clean2-shared', 'ml-pwrite-error', 'ml-snapshot-error', 'ml-restart',
-            'ml-slot-reuse', 'ml-dcache-extend']
+            'ml-slot-reuse', 'ml-dcache-extend', 'ml-late-write-hit', 'ml-late-write-miss', 'ml-read-owner', 'ml-after-shutdown']
 PIN_CASES = ['partial-clean', 'hit-overlap', 'same-entry', 'reader-vs-write', 'evict-pinned', 'timeout-pinned', 'pread-error', 'shutdown-active',
              'worker-flush', 'stress', 'verify-relocation']
 DISK_ONLY = {'pread-error', 'verify-relocation', 'ml-clean2-shared', 'ml-pwrite-error', 'ml-snapshot-error', 'ml-restart', 'ml-dcache-extend'}
@@ -26,8 +26,8 @@ FLUSH_CASES = ['writing', 'error-retry', 'multi-writing2', 'empty-lower-error', 
 ORDER_CASES = ['head-explicit', 'head-flushall', 'head-fua', 'head-maxdelay']
 DIRECT_CASES = ['aligned', 'unaligned-dest', 'unaligned-off', 'unaligned-len', 'tiny', 'full-block', 'slot-boundary', 'identity', 'symlink', 'hardlink', 'range', 'capability',
                 'bound', 'fdmode', 'memory', 'coherence', 'tail', 'eintr', 'einval-fallback', 'eio-error', 'concurrency', 'disabled', 'config']
-# Superseded by the adapted copies in multilevel_test.c (they assert a later reader copies under the old global mutex).
-SUPERSEDED = {'reader-vs-write', 'evict-pinned'}
+# Superseded by the adapted copies in multilevel_test.c: reader-vs-write and evict-pinned assert a later reader copies under the old global mutex; shutdown-active asserts shutdown has already stopped the workers while a reader is active (now it first stops admission and waits for the active read).
+SUPERSEDED = {'reader-vs-write', 'evict-pinned', 'shutdown-active'}
 RD1 = '#include "config.h"\n#include <stdlib.h>\n#define getenv(n) ({ char *_v = (getenv)(n); if (_v != NULL) cc.read_direct = 1; _v; })\n'
 TSAN = (['-O1', '-fsanitize=thread', '-fno-pie'], ['-fsanitize=thread', '-no-pie'], {'TSAN_OPTIONS': 'halt_on_error=1 exitcode=66 second_deadlock_stack=1'})
 ASAN = (['-O1', '-fsanitize=address,undefined', '-fno-sanitize-recover=undefined', '-fno-omit-frame-pointer', '--param=asan-globals=0'], ['-fsanitize=address,undefined'],
@@ -85,7 +85,7 @@ def main():
         (src / 'config.h').write_text(cfg); (src / 'gitrev.c').write_text('const char *const s3backer_version = "";\n')
         cflags, lflags, renv = (san if san else ([], [], {}))
         flags = [a.cc, '-std=gnu11', '-O2', '-g', '-march=x86-64', '-mtune=generic', '-fPIC', '-ffunction-sections', '-fdata-sections', '-pthread', *cflags,
-                 f'-I{src}', f'-I{HERE}', f'-I{deps}/include', f'-I{deps}/include/x86_64-linux-gnu', f'-I{deps}/include/fuse3'] + (['-DREAD_PINS_CANDIDATE'] + (['-DMULTILEVEL_CANDIDATE'] if cand else []))
+                 f'-I{src}', f'-I{HERE}', f'-I{deps}/include', f'-I{deps}/include/x86_64-linux-gnu', f'-I{deps}/include/fuse3'] + (['-DREAD_PINS_CANDIDATE'] + (['-DMULTILEVEL_CANDIDATE'] if cand else []) + (['-DML_HAS_DRAINING'] if 'draining' in (src / 'block_cache.c').read_text() else []))
         libs = [f'-L{lib}', f'-Wl,-rpath,{lib}', '-lfuse3', '-lexpat', '-lcrypto', '-lcurl', '-lz']
         W = lambda *ws: [f'-Wl,--wrap={w}' for w in ws]
         COND = ['pthread_cond_wait', 'pthread_cond_timedwait']
@@ -151,7 +151,7 @@ def main():
         def one(job):
             binary, case, label, use_disk = job
             if time.time() - t_start > a.budget: return label, {'exit': None, 'skipped': 'suite budget exhausted'}
-            attempts = 0
+            attempts = 0; bases = []
             while True:
                 attempts += 1; tenv = dict(env, **renv); cache = None
                 if use_disk:
@@ -164,12 +164,22 @@ def main():
                 if cache: cache.unlink(missing_ok=True)
                 (b / (label.replace('/', '_') + f'.attempt-{attempts}.log')).write_text(text)
                 # A sanitizer environment that cannot start (e.g. ASLR/memory mapping) is retried; a reported race/error never is.
-                # (a SIGSEGV before the test printed anything and with no sanitizer report is the TSAN/ASLR startup crash)
-                startup = ('TSAN_OPTIONS' in renv and ('unexpected memory mapping' in text or 'ThreadSanitizer: failed to' in text or 'FATAL: ThreadSanitizer' in text
-                           or (code in (-11, 139) and not any(m in text for m in ['FAIL', 'PASS', 'observed', 'WARNING: ThreadSanitizer', 'runtime error']))))
+                # Startup basis (TSAN only). 'mapping-message': TSAN printed its fatal init message (pre-main). 'no-start-marker': an ml-test binary
+                # (which flushes "TEST-START <case>" to stderr first thing in main) died without the marker, so it never reached main. 'unverified-no-marker':
+                # a binary without a marker crashed with SIGSEGV/core and no test or sanitizer output; ASSUMED to be the startup crash, not proven.
+                # A test crash after the marker, a test failure, or any sanitizer/race report is never retried.
+                basis = None
+                if 'TSAN_OPTIONS' in renv:
+                    has_marker = 'TEST-START' in text
+                    reported = any(m in text for m in ['WARNING: ThreadSanitizer', 'runtime error', 'FAIL', 'PASS', 'observed'])
+                    crashed = code in (-11, 139) or 'dumped core' in text
+                    if 'unexpected memory mapping' in text or 'ThreadSanitizer: failed to' in text or 'FATAL: ThreadSanitizer' in text: basis = 'mapping-message'
+                    elif crashed and not has_marker and not reported: basis = 'no-start-marker' if pathlib.Path(binary).name.startswith('ml-test') else 'unverified-no-marker'
+                startup = basis is not None
+                bases.append(basis)
                 if startup and attempts < 12: continue
                 break
-            return label, {'exit': code, 'attempts': attempts, 'startup_failure': startup,
+            return label, {'exit': code, 'attempts': attempts, 'startup_failure': startup, 'startup_attempt_basis': [x for x in bases if x],
                            'sanitizer_report': any(m in text for m in ['WARNING: ThreadSanitizer', 'ERROR: AddressSanitizer', 'runtime error:']),
                            'timed_out': code in (124, 137), 'output': text.strip()[-500:]}
         with cf.ThreadPoolExecutor(a.jobs) as ex:

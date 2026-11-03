@@ -389,7 +389,12 @@ static void case_shutdown_active(void) {
     s->watched = 1; start(s);
 #ifdef READ_PINS_CANDIDATE
     REQUIRE(AWAIT(s->w.last == &P->unpinned, WAIT_MS));
+#ifdef ML_HAS_DRAINING
+    // ML-ADAPT: shutdown first stops admission and waits for the active read (workers still run); stopping is set afterwards
+    pthread_mutex_lock(&P->mutex); REQUIRE(P->draining && !P->stopping && P->active_ops == 1 && P->num_pins == 1); pthread_mutex_unlock(&P->mutex);
+#else
     pthread_mutex_lock(&P->mutex); REQUIRE(P->num_threads == 0 && P->stopping && P->num_pins == 1); pthread_mutex_unlock(&P->mutex);
+#endif
 #else
     REQUIRE(!AWAIT(s->done, 1000));
 #endif
@@ -415,6 +420,7 @@ static void case_worker_flush(void) {
     REQUIRE(GET(bgen[1]) == 700 && GET(bgen[3]) == 701);
     release(a); release(c); finish(a); finish(c);
     REQUIRE(got(a) == cached[0]); REQUIRE(got(c) == cached[2]);
+    for (int i = 0; i < WAIT_MS && !(state_of(0) == CLEAN && state_of(1) == CLEAN && state_of(3) == CLEAN); i += 5) nap(5);   // review N2: CLEAN follows the backend write asynchronously
     REQUIRE(state_of(0) == CLEAN && state_of(1) == CLEAN && state_of(3) == CLEAN);
     free(a); free(f); free(c);
 }
@@ -535,6 +541,7 @@ static void wait_state(int b, int st) {
     for (int i = 0; i < WAIT_MS; i += 5) { if (state_of(b) == st) return; nap(5); }
     fprintf(stderr, "FAIL block %d state %d != %d\n", b, state_of(b), st); exit(1);
 }
+static void close_cache_keep(void) { REQUIRE(cache->shutdown(cache) == 0); }
 static void flush_all(void) { REQUIRE(cache->flush_blocks(cache, NULL, 0, 0) == 0); }
 static void rgate_permit_to(int n) { pthread_mutex_lock(&g_mu); rgate_permit = n; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu); }
 static void wgate_open(int b) { pthread_mutex_lock(&g_mu); wgate_block = b; wgate_permit = 0; wgate_entered = 0; pthread_mutex_unlock(&g_mu); }
@@ -843,6 +850,78 @@ static void case_ml_dcache_extend(void) {
     for (int i = 0; i < 12; i++) REQUIRE(read_sync(i, 0, BS) == 300 + i);
 }
 
+// Shutdown versus requests that arrive or are active while it drains (review B1/B2). A request is either rejected with ENOTCONN
+// (nothing acknowledged) or admitted, in which case shutdown must not return before its payload/fill is committed and any
+// acknowledged write has reached the backend. destroy() afterwards must be safe (assert builds abort on a leftover DIRTY entry).
+static int shutdown_begun(void) {
+    pthread_mutex_lock(&P->mutex);
+#ifdef ML_HAS_DRAINING
+    int v = P->draining || P->stopping;
+#else
+    int v = P->stopping;
+#endif
+    pthread_mutex_unlock(&P->mutex); return v;
+}
+static void wait_shutdown_begun(void) {
+    for (int i = 0; i < WAIT_MS; i += 2) { if (shutdown_begun()) return; nap(2); }
+    fprintf(stderr, "FAIL setup: shutdown did not begin\n"); exit(2);
+}
+static void wait_no_workers(void) {
+    for (int i = 0; i < WAIT_MS; i += 2) { pthread_mutex_lock(&P->mutex); const u_int n = P->num_threads; pthread_mutex_unlock(&P->mutex); if (n == 0) return; nap(2); }
+}
+static void case_ml_late_write_hit(void) {
+    open_x(8); warm(0); wgate_open(1); write_sync(1, 600);
+    struct op *r = reader(0, 0, BS, 1, 1), *s = op_new(OP_SHUTDOWN, 0), *w = writer(0, 820, 0, 0);
+    start(r); REQUIRE(AWAIT(r->g.entered, WAIT_MS));                           // a reader holds the entry's lock
+    start(s); REQUIRE(AWAIT(wgate_entered >= 1, WAIT_MS)); wait_shutdown_begun();   // drain begun, one worker held in a PUT
+    start(w); REQUIRE(AWAIT(w->done, 400) || GET(w->w.waits) >= 1);            // late write: rejected, or admitted and waiting
+    wgate_release(); nap(100);
+    release(r); finish(r); finish(w); finish(s);
+    REQUIRE(s->r == 0); REQUIRE(w->r == 0 || w->r == ENOTCONN);
+    printf("late-write-hit: write_r=%d shutdown_r=%d backend_gen=%d dirties=%u\n", w->r, s->r, GET(bgen[0]), P->num_dirties);
+    if (w->r == 0) REQUIRE(GET(bgen[0]) == 820);                                // acknowledged => uploaded by the successful shutdown
+    else REQUIRE(GET(bgen[0]) == cached[0]);
+    REQUIRE(P->num_dirties == 0); REQUIRE(P->num_refs == 0);
+    cache->destroy(cache); cache = NULL; free(r); free(s); free(w);
+}
+static void case_ml_late_write_miss(void) {
+    open_x(8); wgate_open(1); write_sync(1, 600);
+    struct op *s = op_new(OP_SHUTDOWN, 0), *w = writer(5, 830, 1, 1);
+    start(s); REQUIRE(AWAIT(wgate_entered >= 1, WAIT_MS)); wait_shutdown_begun();
+    start(w); REQUIRE(AWAIT(w->g.entered || w->done, WAIT_MS));
+    const int admitted = GET(w->g.entered);
+    wgate_release();
+    const int early = AWAIT(s->done, 1000) && !GET(w->done);                    // shutdown returned while the payload was in flight
+    release(w); finish(w); finish(s);
+    printf("late-write-miss: admitted=%d shutdown_returned_while_payload_in_flight=%d write_r=%d shutdown_r=%d backend_gen=%d\n",
+      admitted, early, w->r, s->r, GET(bgen[5]));
+    REQUIRE(!early); REQUIRE(s->r == 0); REQUIRE(w->r == 0 || w->r == ENOTCONN);
+    if (w->r == 0) REQUIRE(GET(bgen[5]) == 830); else REQUIRE(GET(bgen[5]) == 15);
+    REQUIRE(P->num_dirties == 0 && P->num_refs == 0);
+    cache->destroy(cache); cache = NULL; free(s); free(w);
+}
+// A miss owner is in the lower layer while shutdown runs: shutdown must wait for it (it holds no reference).
+static void case_ml_read_owner(void) {
+    open_cache(8, 0, 0); rgate_block = 5;
+    struct op *a = reader(5, 0, BS, 0, 0), *s = op_new(OP_SHUTDOWN, 0);
+    start(a); REQUIRE(AWAIT(rgate_entered == 1, WAIT_MS));
+    start(s); const int early = AWAIT(s->done, 1000);
+    rgate_permit_to(1); finish(a); finish(s);
+    printf("read-owner: shutdown_returned_while_owner_in_backend=%d read_r=%d shutdown_r=%d\n", early, a->r, s->r);
+    REQUIRE(!early); REQUIRE(a->r == 0 && s->r == 0);
+    cache->destroy(cache); cache = NULL; free(a); free(s);
+}
+// A request after shutdown completed is rejected, never admitted.
+static void case_ml_after_shutdown(void) {
+    open_x(8); warm(0); write_sync(1, 700); close_cache_keep();
+    unsigned char buf[BS]; fill(buf, 2, 710);
+    REQUIRE(P->num_threads == 0);
+    REQUIRE(cache->write_block(cache, 2, buf, NULL, NULL, NULL) == ENOTCONN);
+    REQUIRE(cache->read_block(cache, 0, buf, NULL, NULL, 0) == ENOTCONN);
+    REQUIRE(GET(bgen[1]) == 700);
+    cache->destroy(cache); cache = NULL;
+}
+
 int main(int argc, char **argv) {
     static const struct { const char *name; void (*fn)(void); } cases[] = {
         { "partial-clean", case_partial_clean }, { "hit-overlap", case_hit_overlap }, { "same-entry", case_same_entry }, { "reader-vs-write", case_reader_vs_write },
@@ -856,9 +935,11 @@ int main(int argc, char **argv) {
         { "ml-upload-rewrite", case_ml_upload_rewrite }, { "ml-singleflight", case_ml_singleflight }, { "ml-fill-error", case_ml_fill_error },
         { "ml-readahead", case_ml_readahead }, { "ml-evict-gate", case_ml_evict_gate }, { "ml-full-dirty", case_ml_full_dirty },
         { "ml-clean2-shared", case_ml_clean2_shared }, { "ml-pwrite-error", case_ml_pwrite_error }, { "ml-snapshot-error", case_ml_snapshot_error },
-        { "ml-restart", case_ml_restart }, { "ml-dcache-extend", case_ml_dcache_extend }, { "ml-slot-reuse", case_ml_slot_reuse },
+        { "ml-restart", case_ml_restart }, { "ml-late-write-hit", case_ml_late_write_hit }, { "ml-late-write-miss", case_ml_late_write_miss },
+        { "ml-read-owner", case_ml_read_owner }, { "ml-after-shutdown", case_ml_after_shutdown }, { "ml-dcache-extend", case_ml_dcache_extend }, { "ml-slot-reuse", case_ml_slot_reuse },
     };
     REQUIRE(argc == 2); tl_test = 1;
+    fprintf(stderr, "TEST-START %s\n", argv[1]);                               // lets the runner tell pre-main startup failures from test crashes
     signal(SIGALRM, watchdog); alarm(60);
     for (int b = 0; b < NB; b++) bgen[b] = 10 + b;
     for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); i++) {

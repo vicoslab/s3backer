@@ -43,8 +43,13 @@ eviction under the mutex), dcache free-list changes, survey callbacks, and debug
   for the entry lock), so FLUSH cannot complete before the writer's payload is committed and unlocked. A full-block write
   miss is a READING entry until its payload and dirty record are written, then DIRTY; FLUSH treats it as not yet written
   (the write has not returned).
-* Shutdown waits for in-flight writes (`pending_writes`) before setting `stopping`, so they can still publish DIRTY to running
-  workers; then drains dirty blocks, joins workers and waits for all references (`num_refs`).
+* Shutdown: under the mutex it sets `draining` (new reads/writes then return `ENOTCONN` and nothing is acknowledged), then waits
+  until every admitted request has returned (`active_ops`: covers write payloads, miss/verify owners in the lower layer, parked
+  disk evictions, and requests blocked on space/dirty limits/READING waiters). The workers keep running and, while draining,
+  upload dirty blocks without waiting for their delay, so admitted writes publish DIRTY and are uploaded and synchronous or
+  `maxDirty` waiters make progress. Only then does it set `stopping`, drain the dirty queue, join the workers and wait for all
+  references (`num_refs`). An admitted write therefore either completes and is uploaded before `shutdown()` returns, or the
+  request was rejected before it mutated anything. FLUSH requests are not part of admission (unchanged).
 * Full cache: allocators sleep on `space_avail` (no spin). While an allocator waits because every CLEAN[2] entry is busy,
   new CLEAN hits wait too (`space_pin_waiters`), so the entries drain. Disk-mode eviction/timeout reclaim parks the victim
   as READING (hashed, not on a list) while its directory record is erased without the mutex; waiters retry afterwards.
@@ -62,13 +67,21 @@ eviction under the mutex), dcache free-list changes, survey callbacks, and debug
   direct reads after a buffered write rely on Linux page-cache coherency (`direct_test coherence`).
 * `fdatasync` now runs concurrently from several threads (over-syncing only). Crash ordering is unchanged (erase before
   data, dirty record before payload, clean record after the PUT), but power-fail behaviour was not exercised.
-* Shutdown with continuously arriving writes can wait for them (no new-write rejection while draining pending writes).
+* Callers that issue requests concurrently with shutdown must tolerate `ENOTCONN` once draining starts. Shutdown waits for
+  admitted requests that are blocked on the lower layer (it cannot abort a stuck backend read/PUT).
 * Tests prove the unit behaviour with fake backends; they do not prove mounted behaviour, performance or crash recovery.
   The `ml-dcache-extend` case passes with `size_mutex` removed (the file-size field is atomic, so TSAN reports no race
   and the padding step is only logically racy); that mutant is **not** detected by this suite.
-* Two baseline cases (`reader-vs-write`, `evict-pinned`) assert a later reader copies under the global mutex and are
-  adapted (marked `ML-ADAPT` in `multilevel_test.c`; the unmodified copies fail on the candidate as expected); the adapted
-  versions assert the stronger entry-lock/queueing behaviour.
+* Three baseline cases are superseded and adapted (marked `ML-ADAPT` in `multilevel_test.c`); the unmodified copies still run on
+  the candidate as expected-failure legacy controls (9 cells per variant, reported as `pins-superseded/*`): `reader-vs-write`
+  and `evict-pinned` assert that a later reader copies under the global mutex, and `shutdown-active` asserts that shutdown has
+  already stopped the workers while a reader is active (shutdown now first stops admission and waits for the active read).
+  The adapted versions assert the stronger entry-lock/queueing/draining behaviour.
+* TSAN on this sandbox often crashes before `main` (address-space randomization). The runner retries only startup failures:
+  `mapping-message` (TSAN fatal init text), `no-start-marker` (an `ml-test` binary, which flushes `TEST-START <case>` to
+  stderr first, died without it) or `unverified-no-marker` (a binary without a marker died with SIGSEGV/core and no output:
+  ASSUMED, not proven, to be that startup crash). Races, sanitizer reports, test failures and crashes after the marker are
+  never retried; every attempt log is kept.
 
 ## Build and tests
 

@@ -112,8 +112,10 @@
  * WRITING2 again, so an old PUT can never mark a newer generation CLEAN. In disk mode the clean directory record is
  * written only while holding the lock shared and re-checking that no writer got in.
  *
- * Shutdown first waits for in-flight writes (priv->pending_writes) so they can publish their DIRTY state to workers
- * that are still running, then drains the dirty queue, joins the workers and waits for all references.
+ * Shutdown first stops admitting requests (priv->draining) and waits for every admitted read/write (priv->active_ops,
+ * which covers miss owners, parked evictions and payload writes) while the workers keep running and write dirty blocks
+ * eagerly, so admitted writes publish DIRTY and are uploaded; requests arriving later get ENOTCONN. Only then does it set
+ * stopping, drain the dirty queue, join the workers and wait for all references.
  */
 
 // Cache entry states
@@ -229,7 +231,8 @@ struct block_cache_private {
     int                             stopping;       // signals worker threads to exit
     u_int                           num_pins;       // sum of entry->readers
     u_int                           num_refs;       // sum of entry->readers + entry->excl_waiters
-    u_int                           pending_writes; // writes between taking a reference and publishing their state
+    u_int                           active_ops;     // admitted read/write requests that have not returned (shutdown drains these)
+    int                             draining;       // shutdown has begun: no new requests are admitted
     u_int                           unpin_waiters;  // threads waiting on 'unpinned'
     u_int                           space_pin_waiters;// allocators waiting because all CLEAN[2] entries are busy
     block_list_func_t               *survey_callback;// non-zero survey is running and this is the callback
@@ -275,7 +278,7 @@ static struct cache_entry *block_cache_entry_alloc(struct block_cache_private *p
 static void block_cache_entry_free(struct cache_entry *entry);
 static void block_cache_entry_ref(struct block_cache_private *priv, struct cache_entry *entry, int shared);
 static void block_cache_entry_unref(struct block_cache_private *priv, struct cache_entry *entry, int shared);
-static void block_cache_write_done(struct block_cache_private *priv);
+static void block_cache_op_done(struct block_cache_private *priv);
 static void block_cache_wait_space(struct block_cache_private *priv);
 static struct cache_entry *block_cache_expired_idle(struct block_cache_private *priv, struct list_head *list, uint32_t now);
 static s3b_hash_visit_t block_cache_free_one;
@@ -734,9 +737,15 @@ block_cache_shutdown(struct s3backer_store *const s3b)
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 0);
 
-    // Writes in flight must publish their DIRTY state while the workers still run
+    /*
+     * Stop admitting requests, then wait for every admitted read/write (including miss owners in the lower layer, parked
+     * evictions and payload writes) to return. The workers keep running and, while draining, write dirty blocks without
+     * waiting for their delay, so admitted writes can publish DIRTY and blocked/synchronous requests make progress.
+     */
+    priv->draining = 1;
+    pthread_cond_broadcast(&priv->worker_work);
     priv->unpin_waiters++;
-    while (priv->pending_writes > 0)
+    while (priv->active_ops > 0)
         pthread_cond_wait(&priv->unpinned, &priv->mutex);
     priv->unpin_waiters--;
 
@@ -775,7 +784,7 @@ block_cache_destroy(struct s3backer_store *const s3b)
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 1);
     assert(TAILQ_FIRST(&priv->dirties) == NULL && priv->num_threads == 0);
-    assert(priv->num_pins == 0 && priv->num_refs == 0 && priv->pending_writes == 0 && priv->unpin_waiters == 0);
+    assert(priv->num_pins == 0 && priv->num_refs == 0 && priv->active_ops == 0 && priv->unpin_waiters == 0);
 
     // Destroy inner store
     (*priv->inner->destroy)(priv->inner);
@@ -913,6 +922,12 @@ block_cache_read(struct block_cache_private *const priv, s3b_block_t block_num, 
 
     // Grab lock
     pthread_mutex_lock(&priv->mutex);
+
+    // Admission: once shutdown has begun no new read is accepted; an admitted one completes before shutdown returns
+    if (priv->draining) {
+        CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+        return ENOTCONN;
+    }
     S3BCACHE_CHECK_INVARIANTS(priv, 0);
 
     // Sanity check
@@ -921,6 +936,7 @@ block_cache_read(struct block_cache_private *const priv, s3b_block_t block_num, 
         r = ENOTCONN;
         goto done;
     }
+    priv->active_ops++;
 
     // Update count of block(s) read sequentially by the upper layer
     if (block_num == priv->seq_last + 1) {
@@ -939,6 +955,7 @@ block_cache_read(struct block_cache_private *const priv, s3b_block_t block_num, 
 
     // Peform the read
     r = block_cache_do_read(priv, block_num, off, len, dest, 1);
+    block_cache_op_done(priv);
 
 done:
     // Release lock
@@ -1237,6 +1254,13 @@ block_cache_write(struct block_cache_private *const priv, s3b_block_t block_num,
     // Grab lock
     pthread_mutex_lock(&priv->mutex);
 
+    // Admission: once shutdown has begun no new write is accepted; an admitted one completes before shutdown returns
+    if (priv->draining) {
+        CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+        return ENOTCONN;
+    }
+    priv->active_ops++;
+
 again:
     // Sanity check
     S3BCACHE_CHECK_INVARIANTS(priv, 0);
@@ -1276,7 +1300,6 @@ again:
 
         // Take an exclusive reference (the entry can't be evicted or freed now), then wait for the entry lock unlocked
         block_cache_entry_ref(priv, entry, 0);
-        priv->pending_writes++;
         CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
         pthread_rwlock_wrlock(&entry->lock);
         pthread_mutex_lock(&priv->mutex);
@@ -1289,7 +1312,6 @@ again:
             if (config->max_dirty != 0 && priv->num_dirties >= config->max_dirty) {
                 pthread_rwlock_unlock(&entry->lock);
                 block_cache_entry_unref(priv, entry, 0);
-                block_cache_write_done(priv);
                 pthread_cond_signal(&priv->worker_work);
                 pthread_cond_wait(&priv->write_complete, &priv->mutex);
                 goto again;
@@ -1330,7 +1352,6 @@ again:
         pthread_mutex_lock(&priv->mutex);
         S3BCACHE_CHECK_INVARIANTS(priv, 1);
         block_cache_entry_unref(priv, entry, 0);
-        block_cache_write_done(priv);
         goto success;
     }
 
@@ -1386,7 +1407,6 @@ again:
     ENTRY_RESET_LINK(entry);
     s3b_hash_put_new(priv->hashtable, entry);
     assert(ENTRY_GET_STATE(entry) == READING);
-    priv->pending_writes++;
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
 
     // Record block data, then the dirty directory record
@@ -1406,7 +1426,6 @@ again:
     TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
     priv->num_dirties++;
     assert(ENTRY_GET_STATE(entry) == DIRTY);
-    block_cache_write_done(priv);
     pthread_cond_broadcast(&priv->end_reading);
 
     // Wake up a worker thread to go write it
@@ -1441,6 +1460,7 @@ success:
 
 fail:
     // Done
+    block_cache_op_done(priv);
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
     return r;
 }
@@ -1649,7 +1669,7 @@ block_cache_worker_main(void *arg)
         adjusted_now = now + (uint32_t)(priv->dirty_timeout * (block_cache_dirty_ratio(priv) / priv->max_dirty_ratio));
 
         // See if there is a block that needs writing
-        if ((entry = TAILQ_FIRST(&priv->dirties)) != NULL && (priv->stopping || adjusted_now >= entry->timeout)) {
+        if ((entry = TAILQ_FIRST(&priv->dirties)) != NULL && (priv->stopping || priv->draining || adjusted_now >= entry->timeout)) {
 
             shared_held = 0;
 
@@ -2014,12 +2034,12 @@ block_cache_entry_unref(struct block_cache_private *priv, struct cache_entry *en
     }
 }
 
-// A write that took a reference has finished (published its state or given up). Mutex held.
+// An admitted request has returned (all its entry references, fills and payload writes are finished). Mutex held.
 static void
-block_cache_write_done(struct block_cache_private *priv)
+block_cache_op_done(struct block_cache_private *priv)
 {
-    assert(priv->pending_writes > 0);
-    if (--priv->pending_writes == 0 && priv->unpin_waiters > 0)
+    assert(priv->active_ops > 0);
+    if (--priv->active_ops == 0 && priv->unpin_waiters > 0)
         pthread_cond_broadcast(&priv->unpinned);
 }
 
