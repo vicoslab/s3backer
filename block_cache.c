@@ -80,14 +80,40 @@
  * Only CLEAN and CLEAN2 blocks are eligible to be evicted from the cache. We evict entries
  * either when they timeout or the cache is full and we need to add a new entry to it.
  *
- * Reader pins: a read hit on a CLEAN block may copy its data with the mutex released.
- * Under the mutex the reader updates the LRU, increments entry->readers and captures the
- * data buffer/dslot; it relocks to unpin. A pinned entry stays CLEAN at the same address
- * with the same buffer/dslot: writers wait (counted in excl_waiters, which blocks new pins),
- * eviction skips it, and shutdown waits for all pins to drain. Other hit states, misses
- * and zero-length reads keep copying under the mutex. Pins never change state or the
- * dirty/flush accounting. New pins are also refused while stopping and while an allocator
- * waits for space because every CLEAN[2] entry is busy, so pins always drain.
+ * Two-level locking
+ * -----------------
+ *
+ * priv->mutex (the "global" mutex) protects only metadata: the hash table, the LRU/dirty lists, every entry's
+ * state/timeout/links/reference counts, statistics, flush waiters and the dcache free list. It is never held across
+ * cache-file or backend I/O, an fdatasync() or a payload memcpy().
+ *
+ * Each entry has its own pthread_rwlock_t (entry->lock), initialized when the entry is allocated and valid until the
+ * entry is freed; entries never move. The lock protects the payload bytes (buffer or dslot data) and the dslot's
+ * directory record. Reads of CLEAN, DIRTY, WRITING and WRITING2 entries take it shared, writes and the upload
+ * snapshot's data copy order against writers; a write takes it exclusively, so only same-block operations exclude
+ * each other. On Linux the lock prefers writers (PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP): a reader arriving
+ * while a writer waits queues behind it. Other platforms get the default rwlock policy (no starvation guarantee).
+ *
+ * Lifetime and order: a thread that will use an entry outside the mutex first takes a reference under the mutex
+ * (entry->readers = shared, entry->excl_waiters = exclusive; priv->num_refs is the total), drops the mutex, and only
+ * then blocks on the entry lock. It releases the entry lock, retakes the mutex and drops the reference. The mutex is
+ * never held while blocking on an entry lock, so "entry lock -> mutex" nesting is deadlock free. A referenced entry
+ * is never evicted or freed; READING[2], DIRTY and WRITING[2] entries are never evicted anyway, so the uploader holds no
+ * reference during network I/O. CLEAN2 entries are always idle (writers and readers convert/claim them first).
+ *
+ * READING[2] entries have an owner and no entry lock users: other threads wait on 'end_reading'. The owner does the
+ * lower-layer read, cache-file writes and directory records without the mutex. A disk-cache eviction parks the victim as
+ * READING while its directory record is erased without the mutex; a write miss publishes a READING entry while the
+ * payload is written and then switches it to DIRTY.
+ *
+ * Generations: a writer takes the entry lock exclusively, then (under the mutex) CLEAN->DIRTY or WRITING->WRITING2
+ * before the payload write. The uploader selects DIRTY->WRITING, takes the lock shared and copies; the copy contains
+ * every payload committed before it, so it clears the WRITING2 mark (dirty flag) there. Writers after the copy set
+ * WRITING2 again, so an old PUT can never mark a newer generation CLEAN. In disk mode the clean directory record is
+ * written only while holding the lock shared and re-checking that no writer got in.
+ *
+ * Shutdown first waits for in-flight writes (priv->pending_writes) so they can publish their DIRTY state to workers
+ * that are still running, then drains the dirty queue, joins the workers and waits for all references.
  */
 
 // Cache entry states
@@ -126,7 +152,7 @@
  * This is so we can jam them into 30 bits instead of 64. It's possible for the time value
  * to wrap after about two years; the effect would be mis-timed writes and evictions.
  *
- * In state CLEAN2 only, the ETag to verify immediately follows the structure.
+ * In state CLEAN2 only, "etag" is the ETag to verify.
  */
 struct cache_entry {
     s3b_block_t                     block_num;      // block number - MUST BE FIRST
@@ -134,14 +160,15 @@ struct cache_entry {
     u_int                           dirty:1;        // indicates state DIRTY or WRITING2
     u_int                           verify:1;       // data should be verified first
     uint32_t                        timeout:30;     // when to evict (CLEAN[2]) or write (DIRTY)
-    uint16_t                        readers;        // pinned readers copying data unlocked (CLEAN only)
-    uint16_t                        excl_waiters;   // writers waiting for readers to drain
+    uint16_t                        readers;        // shared references (hit copies, upload snapshot/record)
+    uint16_t                        excl_waiters;   // exclusive references (writers)
     TAILQ_ENTRY(cache_entry)        link;           // next in list (cleans or dirties)
     union {
         void                        *data;          // data buffer in memory
         u_int                       dslot;          // disk cache data slot
     }                               u;
-    u_char                          etag[0];        // ETag (looks like an MD5 checksum) (CLEAN2)
+    u_char                          etag[MD5_DIGEST_LENGTH];    // ETag (looks like an MD5 checksum) (CLEAN2)
+    pthread_rwlock_t                lock;           // payload lock; never taken with the mutex held and blocking
 };
 #define ENTRY_IN_LIST(entry)                ((entry)->link.tqe_prev != NULL)
 #define ENTRY_RESET_LINK(entry)             do { (entry)->link.tqe_prev = NULL; } while (0)
@@ -161,6 +188,9 @@ struct cache_entry {
 
 // Special timeout value for entries in state READING and READING2
 #define READING_TIMEOUT             ((uint32_t)0x3fffffff)
+
+// Internal: the mutex was released, restart the lookup
+#define BLOCK_CACHE_RETRY           (-1)
 
 // Declare the list "head" struct
 TAILQ_HEAD(list_head, cache_entry);
@@ -198,10 +228,13 @@ struct block_cache_private {
     struct block_cache_flush_waiter *flush_waiters; // active flush error recipients
     int                             stopping;       // signals worker threads to exit
     u_int                           num_pins;       // sum of entry->readers
+    u_int                           num_refs;       // sum of entry->readers + entry->excl_waiters
+    u_int                           pending_writes; // writes between taking a reference and publishing their state
     u_int                           unpin_waiters;  // threads waiting on 'unpinned'
     u_int                           space_pin_waiters;// allocators waiting because all CLEAN[2] entries are busy
     block_list_func_t               *survey_callback;// non-zero survey is running and this is the callback
     void                            *survey_arg;    // non-zero survey is running and this is the arg
+    pthread_rwlockattr_t            rwattr;         // attributes for entry locks (writer preference where available)
     pthread_mutex_t                 mutex;          // my mutex
     pthread_cond_t                  space_avail;    // there is new space available in cache
     pthread_cond_t                  end_reading;    // some entry in state READING[2] changed state
@@ -237,9 +270,15 @@ static int block_cache_write(struct block_cache_private *priv, s3b_block_t block
 static void *block_cache_worker_main(void *arg);
 static int block_cache_check_cancel(void *arg, s3b_block_t block_num);
 static int block_cache_get_entry(struct block_cache_private *priv, struct cache_entry **entryp, void **datap);
-static void block_cache_free_entry(struct block_cache_private *priv, struct cache_entry **entryp);
+static void block_cache_free_entry(struct block_cache_private *priv, struct cache_entry *entry);
+static struct cache_entry *block_cache_entry_alloc(struct block_cache_private *priv);
+static void block_cache_entry_free(struct cache_entry *entry);
+static void block_cache_entry_ref(struct block_cache_private *priv, struct cache_entry *entry, int shared);
+static void block_cache_entry_unref(struct block_cache_private *priv, struct cache_entry *entry, int shared);
+static void block_cache_write_done(struct block_cache_private *priv);
+static void block_cache_wait_space(struct block_cache_private *priv);
+static struct cache_entry *block_cache_expired_idle(struct block_cache_private *priv, struct list_head *list, uint32_t now);
 static s3b_hash_visit_t block_cache_free_one;
-static struct cache_entry *block_cache_verified(struct block_cache_private *priv, struct cache_entry *entry);
 static double block_cache_dirty_ratio(struct block_cache_private *priv);
 static void block_cache_worker_wait(struct block_cache_private *priv, struct cache_entry *entry);
 static int block_cache_cond_timedwait(struct block_cache_private *priv, pthread_cond_t *cond, uint64_t wake_time_millis);
@@ -248,8 +287,6 @@ static int block_cache_high_prio(struct block_cache_conf *conf, s3b_block_t bloc
 static uint32_t block_cache_get_time(struct block_cache_private *priv);
 static uint64_t block_cache_get_time_millis(void);
 static int block_cache_read_data(struct block_cache_private *priv, struct cache_entry *entry, void *dest, u_int off, u_int len);
-static int block_cache_read_pinned(struct block_cache_private *priv, struct cache_entry *entry, void *dest, u_int off, u_int len);
-static void block_cache_wait_unpinned(struct block_cache_private *priv, struct cache_entry *entry);
 static struct cache_entry *block_cache_first_idle(struct list_head *list);
 static int block_cache_write_data(struct block_cache_private *priv, struct cache_entry *entry, const void *src, u_int off,
   u_int len);
@@ -314,6 +351,10 @@ block_cache_create(struct block_cache_conf *config, struct s3backer_store *inner
     priv->start_time = block_cache_get_time_millis();
     priv->clean_timeout = (config->timeout + TIME_UNIT_MILLIS - 1) / TIME_UNIT_MILLIS;
     priv->dirty_timeout = (config->write_delay + TIME_UNIT_MILLIS - 1) / TIME_UNIT_MILLIS;
+    pthread_rwlockattr_init(&priv->rwattr);
+#ifdef __GLIBC__
+    pthread_rwlockattr_setkind_np(&priv->rwattr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
     if ((r = pthread_mutex_init(&priv->mutex, NULL)) != 0)
         goto fail2;
     if ((r = pthread_cond_init(&priv->space_avail, NULL)) != 0)
@@ -365,11 +406,11 @@ fail10:
     if (config->cache_file != NULL) {
         while ((entry = TAILQ_FIRST(&priv->lo_cleans)) != NULL) {
             TAILQ_REMOVE(&priv->lo_cleans, entry, link);
-            free(entry);
+            block_cache_entry_free(entry);
         }
         while ((entry = TAILQ_FIRST(&priv->hi_cleans)) != NULL) {
             TAILQ_REMOVE(&priv->hi_cleans, entry, link);
-            free(entry);
+            block_cache_entry_free(entry);
         }
         if (priv->dcache != NULL)
             s3b_dcache_close(priv->dcache);
@@ -392,6 +433,7 @@ fail4:
 fail3:
     pthread_mutex_destroy(&priv->mutex);
 fail2:
+    pthread_rwlockattr_destroy(&priv->rwattr);
     free(priv);
 fail1:
     free(s3b);
@@ -427,7 +469,7 @@ block_cache_dcache_load(void *arg, s3b_block_t dslot, s3b_block_t block_num, con
 
     // Create a new cache entry
     assert(config->cache_file != NULL);
-    if ((entry = calloc(1, sizeof(*entry) + (!config->no_verify ? MD5_DIGEST_LENGTH : 0))) == NULL) {
+    if ((entry = block_cache_entry_alloc(priv)) == NULL) {
         r = errno;
         (*config->log)(LOG_ERR, "can't allocate block cache entry: %s", strerror(r));
         priv->stats.out_of_memory_errors++;
@@ -692,6 +734,12 @@ block_cache_shutdown(struct s3backer_store *const s3b)
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 0);
 
+    // Writes in flight must publish their DIRTY state while the workers still run
+    priv->unpin_waiters++;
+    while (priv->pending_writes > 0)
+        pthread_cond_wait(&priv->unpinned, &priv->mutex);
+    priv->unpin_waiters--;
+
     // Wait for all dirty blocks to be written and all worker threads to exit
     orig_num_threads = priv->num_threads;
     priv->stopping = 1;
@@ -704,9 +752,9 @@ block_cache_shutdown(struct s3backer_store *const s3b)
             (*config->log)(LOG_ERR, "pthread_join: %s", strerror(r));
     }
 
-    // Wait for readers copying pinned entries outside the mutex (no new pins while stopping)
+    // Wait for threads holding references (copying or writing outside the mutex)
     priv->unpin_waiters++;
-    while (priv->num_pins > 0)
+    while (priv->num_refs > 0)
         pthread_cond_wait(&priv->unpinned, &priv->mutex);
     priv->unpin_waiters--;
 
@@ -727,7 +775,7 @@ block_cache_destroy(struct s3backer_store *const s3b)
     pthread_mutex_lock(&priv->mutex);
     S3BCACHE_CHECK_INVARIANTS(priv, 1);
     assert(TAILQ_FIRST(&priv->dirties) == NULL && priv->num_threads == 0);
-    assert(priv->num_pins == 0 && priv->unpin_waiters == 0);
+    assert(priv->num_pins == 0 && priv->num_refs == 0 && priv->pending_writes == 0 && priv->unpin_waiters == 0);
 
     // Destroy inner store
     (*priv->inner->destroy)(priv->inner);
@@ -743,6 +791,7 @@ block_cache_destroy(struct s3backer_store *const s3b)
     pthread_cond_destroy(&priv->worker_work);
     pthread_cond_destroy(&priv->end_reading);
     pthread_cond_destroy(&priv->space_avail);
+    pthread_rwlockattr_destroy(&priv->rwattr);
     CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
     pthread_mutex_destroy(&priv->mutex);
     free(priv->threads);
@@ -900,7 +949,8 @@ done:
 /*
  * Read a block or a portion thereof.
  *
- * Assumes the mutex is held.
+ * Assumes the mutex is held and returns with it held; it is released internally while data is copied
+ * or the lower layer is accessed.
  */
 static int
 block_cache_do_read(struct block_cache_private *const priv, s3b_block_t block_num, u_int off, u_int len, void *dest, int stats)
@@ -910,6 +960,9 @@ block_cache_do_read(struct block_cache_private *const priv, s3b_block_t block_nu
     struct cache_entry *entry;
     u_char etag[MD5_DIGEST_LENGTH];
     int verified_but_not_read = 0;
+    int erase_first = 0;
+    int was_verify = 0;
+    int direct = 0;
     void *data = NULL;
     int r;
 
@@ -919,6 +972,7 @@ block_cache_do_read(struct block_cache_private *const priv, s3b_block_t block_nu
     assert(off + len <= priv->config->block_size);
 
 again:
+    direct = 0;
     // Check to see if a cache entry already exists
     if ((entry = s3b_hash_get(priv->hashtable, block_num)) != NULL) {
         assert(entry->block_num == block_num);
@@ -927,7 +981,8 @@ again:
         case READING2:
             pthread_cond_wait(&priv->end_reading, &priv->mutex);
             goto again;
-        case CLEAN2:        // Go into READING2 state to read/verify the data
+        case CLEAN2:        // Go into READING2 state to read/verify the data (CLEAN2 entries are always idle)
+            assert(!ENTRY_BUSY(entry));
 
             // Allocate temporary buffer for reading the data if necessary
             if (config->cache_file != NULL) {
@@ -939,11 +994,8 @@ again:
             } else
                 data = entry->u.data;
 
-            // Change from CLEAN2 to READING2
-            if (config->cache_file != NULL) {
-                if ((r = s3b_dcache_erase_block(priv->dcache, entry->u.dslot)) != 0)
-                    (*config->log)(LOG_ERR, "can't erase cached block! %s", strerror(r));
-            }
+            // Change from CLEAN2 to READING2; the directory record is erased below with the mutex released
+            erase_first = config->cache_file != NULL;
             TAILQ_REMOVE(cleans_list, entry, link);
             ENTRY_RESET_LINK(entry);
             priv->num_cleans--;
@@ -953,37 +1005,64 @@ again:
 
             // Now go read/verify the data
             goto read;
-        case CLEAN:         // Update timestamp and move to the end of the list to maintain LRU ordering
+        case CLEAN:
+            // While an allocator waits because every CLEAN[2] entry is busy, take no new reference
+            if (priv->space_pin_waiters > 0) {
+                pthread_cond_wait(&priv->space_avail, &priv->mutex);
+                goto again;
+            }
+
+            // Update timestamp and move to the end of the list to maintain LRU ordering
             TAILQ_REMOVE(cleans_list, entry, link);
             TAILQ_INSERT_TAIL(cleans_list, entry, link);
             entry->timeout = block_cache_get_time(priv) + priv->clean_timeout;
-
-            // Copy the data with the mutex released, unless that could delay a writer, allocator or shutdown
-            if (len > 0 && entry->readers < UINT16_MAX && entry->excl_waiters == 0
-              && priv->space_pin_waiters == 0 && !priv->stopping) {
-                if ((r = block_cache_read_pinned(priv, entry, dest, off, len)) != 0)
-                    return r;
-                break;
-            }
+            direct = config->read_direct;               // direct cache-file reads only for CLEAN hits (DIRTY/WRITING are buffered)
             // FALLTHROUGH
-        case DIRTY:         // Copy the cached data
+        case DIRTY:
         case WRITING:
         case WRITING2:
-            if ((r = block_cache_read_data(priv, entry, dest, off, len)) != 0)
-                return r;
+            if (len == 0) {
+                r = 0;
+                break;
+            }
+
+            /*
+             * Copy the cached data with the mutex released. We hold a shared reference (so the entry can't be
+             * evicted or freed) and then the entry's shared lock (so no writer changes the bytes while we copy).
+             * We never block on the entry lock while holding the mutex.
+             */
+            block_cache_entry_ref(priv, entry, 1);
+            CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+            pthread_rwlock_rdlock(&entry->lock);
+            if (config->cache_file == NULL)
+                r = block_cache_read_data(priv, entry, dest, off, len);
+            else if (direct)
+                r = s3b_dcache_read_block_direct(priv->dcache, entry->u.dslot, dest, off, len);
+            else
+                r = block_cache_read_data(priv, entry, dest, off, len);
+            pthread_rwlock_unlock(&entry->lock);
+            pthread_mutex_lock(&priv->mutex);
+            S3BCACHE_CHECK_INVARIANTS(priv, 1);
+            block_cache_entry_unref(priv, entry, 1);
             break;
         default:
+            r = 0;
             assert(0);
             break;
         }
+        if (r != 0)
+            return r;
         if (stats)
             priv->stats.read_hits++;
         return 0;
     }
 
     // Create a new cache entry in state READING
-    if ((r = block_cache_get_entry(priv, &entry, &data)) != 0)
+    if ((r = block_cache_get_entry(priv, &entry, &data)) != 0) {
+        if (r == BLOCK_CACHE_RETRY)
+            goto again;
         return r;
+    }
     if (entry == NULL) {                                            // no free entries right now
         struct cache_entry *dirty_entry = TAILQ_FIRST(&priv->dirties);
 
@@ -992,14 +1071,7 @@ again:
             dirty_entry->timeout = block_cache_get_time(priv);
             pthread_cond_signal(&priv->worker_work);
         }
-
-        // Sleep and try again; if only pins block eviction, stop granting new ones
-        if (priv->num_cleans > 0) {
-            priv->space_pin_waiters++;
-            pthread_cond_wait(&priv->space_avail, &priv->mutex);
-            priv->space_pin_waiters--;
-        } else
-            pthread_cond_wait(&priv->space_avail, &priv->mutex);
+        block_cache_wait_space(priv);
         goto again;
     }
     entry->block_num = block_num;
@@ -1019,48 +1091,31 @@ again:
         (*priv->survey_callback)(priv->survey_arg, &block_num, 1);
 
 read:
-    // Read the block from the underlying s3backer_store
-    assert(ENTRY_GET_STATE(entry) == READING || ENTRY_GET_STATE(entry) == READING2);
-    CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
-    r = (*priv->inner->read_block)(priv->inner, block_num, data, etag, entry->verify ? entry->etag : NULL, 0);
-    pthread_mutex_lock(&priv->mutex);
-    S3BCACHE_CHECK_INVARIANTS(priv, 0);
-
-    // The entry should still exist and be in state READING[2]
-    assert(s3b_hash_get(priv->hashtable, block_num) == entry);
-    assert(ENTRY_GET_STATE(entry) == READING || ENTRY_GET_STATE(entry) == READING2);
-    assert(config->cache_file != NULL || entry->u.data == data);
-
     /*
-     * We know two things at this point: the state is going to
-     * change from READING[2] and we will create new available space
-     * in the cache. Wake up any threads waiting on those events.
+     * The entry is in READING[2]: only this thread may touch its data and directory record (other threads wait on
+     * 'end_reading'). Everything below up to the final locked section happens without the mutex.
      */
-    pthread_cond_broadcast(&priv->end_reading);
-    pthread_cond_signal(&priv->space_avail);
+    assert(ENTRY_GET_STATE(entry) == READING || ENTRY_GET_STATE(entry) == READING2);
+    was_verify = entry->verify;
+    CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+    if (erase_first) {
+        if ((r = s3b_dcache_erase_block(priv->dcache, entry->u.dslot)) != 0)
+            (*config->log)(LOG_ERR, "can't erase cached block! %s", strerror(r));
+    }
+    r = (*priv->inner->read_block)(priv->inner, block_num, data, etag, was_verify ? entry->etag : NULL, 0);
 
     // Check for unexpected error from underlying s3backer_store
-    if (r != 0 && !(entry->verify && r == EEXIST))
+    if (r != 0 && !(was_verify && r == EEXIST))
         goto fail;
 
     // Handle READING2 blocks that were verified (revert to READING)
-    if (entry->verify) {
-        if (r == EEXIST) {                  // ETag matched our expectation, download avoided
-            priv->stats.read_hits++;
-            priv->stats.verified++;
-            verified_but_not_read = 1;
-            r = 0;
-        } else {
-            assert(r == 0);
-            priv->stats.read_misses++;
-            priv->stats.mismatch++;
-        }
-        entry = block_cache_verified(priv, entry);
-        assert(ENTRY_GET_STATE(entry) == READING);
+    if (was_verify && r == EEXIST) {            // ETag matched our expectation, download avoided
+        verified_but_not_read = 1;
+        r = 0;
     }
 
     // Copy the block data's into the destination buffer
-    if (!verified_but_not_read)
+    if (!verified_but_not_read && len > 0)
         memcpy(dest, (char *)data + off, len);
 
     // Copy data into the disk cache and free temporary buffer (if necessary)
@@ -1070,35 +1125,63 @@ read:
                 goto fail;
         }
         free(data);
+        data = NULL;
     }
 
-    // Change entry from READING to CLEAN
-    assert(ENTRY_GET_STATE(entry) == READING);
-    assert(!entry->verify);
+    // Record the clean block (a failure is only logged: the block is still valid in this run)
     if (config->cache_file != NULL) {
         if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, etag)) != 0)
             (*config->log)(LOG_ERR, "can't record cached block! %s", strerror(r));
     }
+    pthread_mutex_lock(&priv->mutex);
+    S3BCACHE_CHECK_INVARIANTS(priv, 1);
+
+    // The entry should still exist and be in state READING[2]
+    assert(s3b_hash_get(priv->hashtable, block_num) == entry);
+    assert(ENTRY_GET_STATE(entry) == READING || ENTRY_GET_STATE(entry) == READING2);
+
+    // Update stats (done here because they need the mutex)
+    if (was_verify) {
+        if (verified_but_not_read) {
+            priv->stats.read_hits++;
+            priv->stats.verified++;
+        } else {
+            priv->stats.read_misses++;
+            priv->stats.mismatch++;
+        }
+    }
+
+    // Change entry from READING[2] to CLEAN
+    entry->verify = 0;
     entry->timeout = block_cache_get_time(priv) + priv->clean_timeout;
     TAILQ_INSERT_TAIL(cleans_list, entry, link);
     priv->num_cleans++;
     assert(ENTRY_GET_STATE(entry) == CLEAN);
+    pthread_cond_broadcast(&priv->end_reading);
+    pthread_cond_broadcast(&priv->space_avail);
 
     // If data was only verified, we have to actually go read it now
-    if (verified_but_not_read)
+    if (verified_but_not_read) {
+        verified_but_not_read = 0;
+        erase_first = 0;
         goto again;
+    }
 
     // Done
     return 0;
 
 fail:
     assert(r != 0);
+    pthread_mutex_lock(&priv->mutex);
+    S3BCACHE_CHECK_INVARIANTS(priv, 1);
     assert(ENTRY_GET_STATE(entry) == READING || ENTRY_GET_STATE(entry) == READING2);
     if (config->cache_file != NULL)
         s3b_dcache_free_block(priv->dcache, entry->u.dslot);
     s3b_hash_remove(priv->hashtable, entry->block_num);
     free(data);
-    free(entry);
+    block_cache_entry_free(entry);
+    pthread_cond_broadcast(&priv->end_reading);     // waiters retry; one of them becomes the next owner
+    pthread_cond_broadcast(&priv->space_avail);
     return r;
 }
 
@@ -1131,6 +1214,10 @@ block_cache_write_block_part(struct s3backer_store *s3b, s3b_block_t block_num, 
 
 /*
  * Write a block or a portion thereof.
+ *
+ * The mutex is held only for metadata. A write to an existing entry takes an exclusive reference under the mutex,
+ * then waits for the entry's exclusive lock without the mutex; the payload copy and cache-file writes happen
+ * under the entry lock only, so writes to different blocks (and reads of other blocks) overlap.
  */
 static int
 block_cache_write(struct block_cache_private *const priv, s3b_block_t block_num, u_int off, u_int len, const void *src)
@@ -1138,6 +1225,7 @@ block_cache_write(struct block_cache_private *const priv, s3b_block_t block_num,
     struct block_cache_conf *const config = priv->config;
     struct list_head *const cleans_list = block_cache_cleans_list(priv, block_num);
     struct cache_entry *entry;
+    int record_dirty;
     int partial_miss = 0;
     int r;
 
@@ -1166,51 +1254,83 @@ again:
         case READING2:
             pthread_cond_wait(&priv->end_reading, &priv->mutex);
             goto again;
-        case CLEAN2:                // convert to CLEAN, then proceed
-            entry = block_cache_verified(priv, entry);
+        case CLEAN2:                // convert to CLEAN (CLEAN2 entries are idle, the entry does not move), then proceed
+            entry->verify = 0;
             // FALLTHROUGH
-        case CLEAN:                // update data, move to state DIRTY
-
-            // Readers may be copying the data unlocked; wait for them, then revalidate
-            if (entry->readers > 0) {
-                block_cache_wait_unpinned(priv, entry);
-                goto again;
-            }
-
+        case CLEAN:                 // update data, move to state DIRTY
             // If there are too many dirty blocks, we have to wait
             if (config->max_dirty != 0 && priv->num_dirties >= config->max_dirty) {
                 pthread_cond_signal(&priv->worker_work);
                 pthread_cond_wait(&priv->write_complete, &priv->mutex);
                 goto again;
             }
-
-            // Record dirty disk cache entry
-            if (config->cache_file != NULL) {
-                if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, NULL)) != 0)
-                    (*config->log)(LOG_ERR, "can't dirty cached block %u! %s", block_num,  strerror(r));
-            }
-
-            // Change from CLEAN to DIRTY
-            TAILQ_REMOVE(cleans_list, entry, link);
-            priv->num_cleans--;
-            TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
-            priv->num_dirties++;
-            entry->timeout = block_cache_get_time(priv) + priv->dirty_timeout;
-            pthread_cond_signal(&priv->worker_work);
             // FALLTHROUGH
-        case WRITING2:              // update data, stay in state WRITING2
-        case WRITING:               // update data, move to state WRITING2
-        case DIRTY:                 // update data, stay in state DIRTY
-            if ((r = block_cache_write_data(priv, entry, src, off, len)) != 0)
-                (*config->log)(LOG_ERR, "error updating dirty block! %s", strerror(r));
-            entry->dirty = 1;
-            if (!partial_miss)
-                priv->stats.write_hits++;
+        case WRITING2:
+        case WRITING:
+        case DIRTY:
             break;
         default:
             assert(0);
             break;
         }
+
+        // Take an exclusive reference (the entry can't be evicted or freed now), then wait for the entry lock unlocked
+        block_cache_entry_ref(priv, entry, 0);
+        priv->pending_writes++;
+        CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+        pthread_rwlock_wrlock(&entry->lock);
+        pthread_mutex_lock(&priv->mutex);
+        S3BCACHE_CHECK_INVARIANTS(priv, 1);
+
+        // Revalidate the state: an upload may have completed or started while we waited for the lock
+        record_dirty = 0;
+        switch (ENTRY_GET_STATE(entry)) {
+        case CLEAN:
+            if (config->max_dirty != 0 && priv->num_dirties >= config->max_dirty) {
+                pthread_rwlock_unlock(&entry->lock);
+                block_cache_entry_unref(priv, entry, 0);
+                block_cache_write_done(priv);
+                pthread_cond_signal(&priv->worker_work);
+                pthread_cond_wait(&priv->write_complete, &priv->mutex);
+                goto again;
+            }
+
+            // Change from CLEAN to DIRTY (the directory record is written below, before the data)
+            record_dirty = config->cache_file != NULL;
+            TAILQ_REMOVE(cleans_list, entry, link);
+            priv->num_cleans--;
+            entry->dirty = 1;
+            TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
+            priv->num_dirties++;
+            entry->timeout = block_cache_get_time(priv) + priv->dirty_timeout;
+            pthread_cond_signal(&priv->worker_work);
+            break;
+        case WRITING:               // update data, move to state WRITING2
+            entry->dirty = 1;
+            break;
+        case WRITING2:              // update data, stay in state WRITING2
+        case DIRTY:                 // update data, stay in state DIRTY
+            break;
+        default:                    // CLEAN2 and READING[2] are impossible while we hold a reference
+            assert(0);
+            break;
+        }
+        if (!partial_miss)
+            priv->stats.write_hits++;
+
+        // Update the data and directory with only the entry lock held
+        CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+        if (record_dirty) {
+            if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, NULL)) != 0)
+                (*config->log)(LOG_ERR, "can't dirty cached block %u! %s", block_num,  strerror(r));
+        }
+        if ((r = block_cache_write_data(priv, entry, src, off, len)) != 0)
+            (*config->log)(LOG_ERR, "error updating dirty block! %s", strerror(r));
+        pthread_rwlock_unlock(&entry->lock);
+        pthread_mutex_lock(&priv->mutex);
+        S3BCACHE_CHECK_INVARIANTS(priv, 1);
+        block_cache_entry_unref(priv, entry, 0);
+        block_cache_write_done(priv);
         goto success;
     }
 
@@ -1238,8 +1358,11 @@ again:
     }
 
     // Get a cache entry, evicting a CLEAN[2] entry if necessary
-    if ((r = block_cache_get_entry(priv, &entry, NULL)) != 0)
+    if ((r = block_cache_get_entry(priv, &entry, NULL)) != 0) {
+        if (r == BLOCK_CACHE_RETRY)
+            goto again;
         goto fail;
+    }
 
     // If cache is full, wait for an entry to go CLEAN[2] so we can evict it
     if (entry == NULL) {
@@ -1250,37 +1373,41 @@ again:
             dirty_entry->timeout = block_cache_get_time(priv);
             pthread_cond_signal(&priv->worker_work);
         }
-
-        // Sleep and try again; if only pins block eviction, stop granting new ones
-        if (priv->num_cleans > 0) {
-            priv->space_pin_waiters++;
-            pthread_cond_wait(&priv->space_avail, &priv->mutex);
-            priv->space_pin_waiters--;
-        } else
-            pthread_cond_wait(&priv->space_avail, &priv->mutex);
+        block_cache_wait_space(priv);
         goto again;
     }
 
-    // Record block data
-    if ((r = block_cache_write_data(priv, entry, src, off, len)) != 0)
-        (*config->log)(LOG_ERR, "error updating dirty block! %s", strerror(r));
-
-    // Initialize a new DIRTY cache entry
+    // Publish the new entry as READING (others wait for it) while its data is written without the mutex
     priv->stats.write_misses++;
     entry->block_num = block_num;
-    entry->timeout = block_cache_get_time(priv) + priv->dirty_timeout;
-    entry->dirty = 1;
-    assert(off == 0 && len == config->block_size);
+    entry->dirty = 0;
+    entry->verify = 0;
+    entry->timeout = READING_TIMEOUT;
+    ENTRY_RESET_LINK(entry);
     s3b_hash_put_new(priv->hashtable, entry);
-    TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
-    priv->num_dirties++;
-    assert(ENTRY_GET_STATE(entry) == DIRTY);
+    assert(ENTRY_GET_STATE(entry) == READING);
+    priv->pending_writes++;
+    CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
 
-    // Record dirty disk cache entry
+    // Record block data, then the dirty directory record
+    assert(off == 0 && len == config->block_size);
+    if ((r = block_cache_write_data(priv, entry, src, off, len)) != 0)
+        (*config->log)(LOG_ERR, "error updating dirty block! %s", strerror(r));
     if (config->cache_file != NULL) {
         if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, NULL)) != 0)
             (*config->log)(LOG_ERR, "can't dirty cached block %u! %s", block_num,  strerror(r));
     }
+    pthread_mutex_lock(&priv->mutex);
+    S3BCACHE_CHECK_INVARIANTS(priv, 1);
+
+    // Change the new entry from READING to DIRTY
+    entry->timeout = block_cache_get_time(priv) + priv->dirty_timeout;
+    entry->dirty = 1;
+    TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
+    priv->num_dirties++;
+    assert(ENTRY_GET_STATE(entry) == DIRTY);
+    block_cache_write_done(priv);
+    pthread_cond_broadcast(&priv->end_reading);
 
     // Wake up a worker thread to go write it
     pthread_cond_signal(&priv->worker_work);
@@ -1337,13 +1464,14 @@ block_cache_write_failed(struct block_cache_private *priv, struct cache_entry *e
 
 /*
  * Acquire a new cache entry. If the cache is full, and there is at least one
- * CLEAN[2] entry, evict and return it (uninitialized). Otherwise, return NULL entry.
+ * idle CLEAN[2] entry, evict it. Otherwise, return NULL entry.
  *
  * On successful return, *datap will point to a malloc'd buffer for the data. If using
  * the disk cache, this will be a temporary buffer, otherwise it's the in-memory buffer.
  * If datap == NULL, then in the case of the disk cache only, no buffer is allocated.
  *
- * This assumes the mutex is held.
+ * This assumes the mutex is held. Returns BLOCK_CACHE_RETRY if the mutex was released (disk cache eviction erases
+ * the directory record without the mutex) so the caller must re-evaluate everything from its lookup.
  *
  * Returns non-zero on error.
  */
@@ -1365,17 +1493,17 @@ again:
      * blocks before high priority blocks.
      */
     if (s3b_hash_size(priv->hashtable) < config->cache_size) {
-        if ((entry = calloc(1, sizeof(*entry))) == NULL) {
+        if ((entry = block_cache_entry_alloc(priv)) == NULL) {
             r = errno;
             (*config->log)(LOG_ERR, "can't allocate block cache entry: %s", strerror(r));
             priv->stats.out_of_memory_errors++;
             return r;
         }
-    } else if ((entry = block_cache_first_idle(&priv->lo_cleans)) != NULL) {
-        block_cache_free_entry(priv, &entry);
-        goto again;
-    } else if ((entry = block_cache_first_idle(&priv->hi_cleans)) != NULL) {
-        block_cache_free_entry(priv, &entry);
+    } else if ((entry = block_cache_first_idle(&priv->lo_cleans)) != NULL
+      || (entry = block_cache_first_idle(&priv->hi_cleans)) != NULL) {
+        block_cache_free_entry(priv, entry);
+        if (config->cache_file != NULL)
+            return BLOCK_CACHE_RETRY;
         goto again;
     } else
         goto done;
@@ -1386,7 +1514,7 @@ again:
             r = errno;
             (*config->log)(LOG_ERR, "can't allocate block cache buffer: %s", strerror(r));
             priv->stats.out_of_memory_errors++;
-            free(entry);
+            block_cache_entry_free(entry);
             return r;
         }
     }
@@ -1398,7 +1526,7 @@ again:
         (*config->log)(LOG_ERR, "can't alloc cached block! %s", strerror(r));
         free(data);             // OK if NULL
         data = NULL;
-        free(entry);
+        block_cache_entry_free(entry);
         entry = NULL;
         goto done;
     }
@@ -1412,13 +1540,16 @@ done:
 }
 
 /*
- * Evict a CLEAN[2] entry.
+ * Evict an idle CLEAN[2] entry.
+ *
+ * Memory cache: done under the mutex. Disk cache: the entry is parked in the hash table as READING (so nobody uses it
+ * or re-creates the block) while its directory record is erased with the mutex RELEASED; the slot is freed afterwards.
+ * Callers must therefore re-validate everything after this returns in disk-cache mode. Mutex held on return.
  */
 static void
-block_cache_free_entry(struct block_cache_private *priv, struct cache_entry **entryp)
+block_cache_free_entry(struct block_cache_private *priv, struct cache_entry *entry)
 {
     struct block_cache_conf *const config = priv->config;
-    struct cache_entry *const entry = *entryp;
     struct list_head *const cleans_list = block_cache_cleans_list(priv, entry->block_num);
     int r;
 
@@ -1426,25 +1557,33 @@ block_cache_free_entry(struct block_cache_private *priv, struct cache_entry **en
     assert(ENTRY_GET_STATE(entry) == CLEAN || ENTRY_GET_STATE(entry) == CLEAN2);
     assert(!ENTRY_BUSY(entry));
 
-    // Invalidate caller's pointer
-    *entryp = NULL;
-
-    // Free the data
-    if (config->cache_file != NULL) {
-        if ((r = s3b_dcache_erase_block(priv->dcache, entry->u.dslot)) != 0)
-            (*config->log)(LOG_ERR, "can't erase cached block! %s", strerror(r));
-        if ((r = s3b_dcache_free_block(priv->dcache, entry->u.dslot)) != 0)
-            (*config->log)(LOG_ERR, "can't free cached block! %s", strerror(r));
-    } else
-        free(entry->u.data);
-
     // Remove entry from the clean list
     TAILQ_REMOVE(cleans_list, entry, link);
-    s3b_hash_remove(priv->hashtable, entry->block_num);
     priv->num_cleans--;
 
-    // Free the entry
-    free(entry);
+    // Memory cache: free everything now
+    if (config->cache_file == NULL) {
+        free(entry->u.data);
+        s3b_hash_remove(priv->hashtable, entry->block_num);
+        block_cache_entry_free(entry);
+        return;
+    }
+
+    // Disk cache: park as READING while the directory record is erased without the mutex
+    ENTRY_RESET_LINK(entry);
+    entry->verify = 0;
+    entry->timeout = READING_TIMEOUT;
+    assert(ENTRY_GET_STATE(entry) == READING);
+    CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+    if ((r = s3b_dcache_erase_block(priv->dcache, entry->u.dslot)) != 0)
+        (*config->log)(LOG_ERR, "can't erase cached block! %s", strerror(r));
+    pthread_mutex_lock(&priv->mutex);
+    if ((r = s3b_dcache_free_block(priv->dcache, entry->u.dslot)) != 0)
+        (*config->log)(LOG_ERR, "can't free cached block! %s", strerror(r));
+    s3b_hash_remove(priv->hashtable, entry->block_num);
+    block_cache_entry_free(entry);
+    pthread_cond_broadcast(&priv->end_reading);         // wake any thread that found the parked entry
+    pthread_cond_broadcast(&priv->space_avail);
 }
 
 /*
@@ -1461,6 +1600,7 @@ block_cache_worker_main(void *arg)
     u_char etag[MD5_DIGEST_LENGTH];
     uint32_t adjusted_now;
     uint32_t now;
+    int shared_held;
     u_int thread_id;
     void *buf;
     int r;
@@ -1490,26 +1630,19 @@ block_cache_worker_main(void *arg)
         now = block_cache_get_time(priv);
 
         // Evict any CLEAN[2] blocks that have timed out (if enabled); busy entries are skipped
-        // here and the last reader to unpin a timed out entry wakes us
+        // here and the last reference holder to drop a timed out entry wakes us. In disk mode each
+        // eviction releases the mutex, so we rescan from the front after every one.
         if (priv->clean_timeout != 0) {
-            struct cache_entry *next_entry;
+            struct cache_entry *victim;
 
-            for (clean_entry = TAILQ_FIRST(&priv->lo_cleans);
-              clean_entry != NULL && now >= clean_entry->timeout; clean_entry = next_entry) {
-                next_entry = TAILQ_NEXT(clean_entry, link);
-                if (ENTRY_BUSY(clean_entry))
-                    continue;
-                block_cache_free_entry(priv, &clean_entry);
-                pthread_cond_signal(&priv->space_avail);
+            while ((victim = block_cache_expired_idle(priv, &priv->lo_cleans, now)) != NULL
+              || (victim = block_cache_expired_idle(priv, &priv->hi_cleans, now)) != NULL) {
+                block_cache_free_entry(priv, victim);
+                pthread_cond_broadcast(&priv->space_avail);
             }
             for (clean_entry = TAILQ_FIRST(&priv->hi_cleans);
-              clean_entry != NULL && now >= clean_entry->timeout; clean_entry = next_entry) {
-                next_entry = TAILQ_NEXT(clean_entry, link);
-                if (ENTRY_BUSY(clean_entry))
-                    continue;
-                block_cache_free_entry(priv, &clean_entry);
-                pthread_cond_signal(&priv->space_avail);
-            }
+              clean_entry != NULL && now >= clean_entry->timeout; clean_entry = TAILQ_NEXT(clean_entry, link))
+                ;
         }
 
         // As we approach our maximum dirty block limit, force earlier than planned writes
@@ -1518,25 +1651,50 @@ block_cache_worker_main(void *arg)
         // See if there is a block that needs writing
         if ((entry = TAILQ_FIRST(&priv->dirties)) != NULL && (priv->stopping || adjusted_now >= entry->timeout)) {
 
+            shared_held = 0;
+
             // If we are also supposed to do read-ahead, wake up a sibling to handle it
             if (priv->seq_count >= config->read_ahead_trigger && priv->ra_count < config->read_ahead)
                 pthread_cond_signal(&priv->worker_work);
 
-            // Copy data to our private buffer; it may change while we're writing
-            if ((r = block_cache_read_data(priv, entry, buf, 0, config->block_size)) != 0) {
-                (*config->log)(LOG_ERR, "error reading cached block! %s", strerror(r));
-                block_cache_write_failed(priv, entry, r);
-                entry->timeout = block_cache_get_time(priv) + (priv->dirty_timeout ? priv->dirty_timeout : 1);
-                block_cache_worker_wait(priv, entry);
-                continue;
-            }
-
-            // Move to WRITING state
+            /*
+             * Select the block: it becomes WRITING and we take a shared reference. Then, without the mutex, wait for
+             * any writer that holds the entry lock and copy the data to our private buffer (it may change while
+             * we're writing). A writer that gets in before our copy is absorbed by it; one that comes later
+             * moves the entry to WRITING2.
+             */
             assert(ENTRY_GET_STATE(entry) == DIRTY);
             TAILQ_REMOVE(&priv->dirties, entry, link);
             ENTRY_RESET_LINK(entry);
             entry->dirty = 0;
             entry->timeout = 0;
+            assert(ENTRY_GET_STATE(entry) == WRITING);
+            block_cache_entry_ref(priv, entry, 1);
+            CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+            pthread_rwlock_rdlock(&entry->lock);
+            r = block_cache_read_data(priv, entry, buf, 0, config->block_size);
+            pthread_mutex_lock(&priv->mutex);
+            S3BCACHE_CHECK_INVARIANTS(priv, 1);
+            if (r != 0) {                           // back to DIRTY at the head of the queue, retry later
+                (*config->log)(LOG_ERR, "error reading cached block! %s", strerror(r));
+                entry->dirty = 1;
+                TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
+                block_cache_write_failed(priv, entry, r);
+                entry->timeout = block_cache_get_time(priv) + (priv->dirty_timeout ? priv->dirty_timeout : 1);
+                pthread_rwlock_unlock(&entry->lock);
+                block_cache_entry_unref(priv, entry, 1);
+                block_cache_worker_wait(priv, entry);
+                continue;
+            }
+
+            /*
+             * The copy holds every payload committed so far (writers hold the entry lock exclusively until their
+             * payload is complete and could only mark the entry WRITING2 before our copy). Writers from now on
+             * must be detected as WRITING2; release the lock and the reference before touching the network.
+             */
+            entry->dirty = 0;
+            pthread_rwlock_unlock(&entry->lock);
+            block_cache_entry_unref(priv, entry, 1);
             assert(ENTRY_GET_STATE(entry) == WRITING);
 
             // Attempt to write the block
@@ -1561,12 +1719,29 @@ block_cache_worker_main(void *arg)
 
             entry->write_error = 0;
 
-            // If block was not modified while being written (WRITING), it is now CLEAN
-            if (!entry->dirty) {
-                if (config->cache_file != NULL) {
+            /*
+             * Disk cache: the clean directory record may be written only while no writer can modify the data, so hold
+             * the entry lock shared across the check and the record. A writer that gets in first leaves WRITING2.
+             */
+            if (config->cache_file != NULL && !entry->dirty) {
+                block_cache_entry_ref(priv, entry, 1);
+                CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
+                pthread_rwlock_rdlock(&entry->lock);
+                pthread_mutex_lock(&priv->mutex);
+                if (entry->dirty) {
+                    pthread_rwlock_unlock(&entry->lock);
+                    block_cache_entry_unref(priv, entry, 1);
+                } else {
+                    CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
                     if ((r = s3b_dcache_record_block(priv->dcache, entry->u.dslot, entry->block_num, etag)) != 0)
                         (*config->log)(LOG_ERR, "can't record cached block! %s", strerror(r));
+                    pthread_mutex_lock(&priv->mutex);
+                    shared_held = 1;
                 }
+            }
+
+            // If block was not modified while being written (WRITING), it is now CLEAN
+            if (!entry->dirty) {
                 priv->num_dirties--;
                 cleans_list = block_cache_cleans_list(priv, entry->block_num);
                 TAILQ_INSERT_TAIL(cleans_list, entry, link);
@@ -1574,8 +1749,12 @@ block_cache_worker_main(void *arg)
                 entry->timeout = block_cache_get_time(priv) + priv->clean_timeout;
                 priv->num_cleans++;
                 assert(ENTRY_GET_STATE(entry) == CLEAN);
-                pthread_cond_signal(&priv->space_avail);
+                pthread_cond_broadcast(&priv->space_avail);
                 pthread_cond_broadcast(&priv->write_complete);
+                if (shared_held) {
+                    pthread_rwlock_unlock(&entry->lock);
+                    block_cache_entry_unref(priv, entry, 1);
+                }
                 continue;
             }
 
@@ -1583,6 +1762,10 @@ block_cache_worker_main(void *arg)
             TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
             entry->timeout = now + priv->dirty_timeout;     // update for 2nd write timing conservatively
             pthread_cond_broadcast(&priv->write_complete);
+            if (shared_held) {
+                pthread_rwlock_unlock(&entry->lock);
+                block_cache_entry_unref(priv, entry, 1);
+            }
             continue;
         }
 
@@ -1754,42 +1937,122 @@ block_cache_free_one(void *arg, void *value)
 
     if (config->cache_file == NULL)
         free(entry->u.data);
-    free(entry);
+    block_cache_entry_free(entry);
     return 0;
 }
 
 /*
- * Mark an entry verified and free the extra bytes we allocated for the ETag.
+ * Entry allocation. Entries never move: the per-entry lock is initialized once and destroyed only when the
+ * entry is freed (which requires that no reference is held).
  */
 static struct cache_entry *
-block_cache_verified(struct block_cache_private *priv, struct cache_entry *entry)
+block_cache_entry_alloc(struct block_cache_private *priv)
 {
-    struct list_head *const cleans_list = block_cache_cleans_list(priv, entry->block_num);
-    struct cache_entry *new_entry;
+    struct cache_entry *entry;
+    int r;
 
-    // Sanity check (relocation below is why only CLEAN entries are ever pinned)
-    assert(entry->verify);
-    assert(ENTRY_GET_STATE(entry) == CLEAN2 || ENTRY_GET_STATE(entry) == READING2);
-    assert(!ENTRY_BUSY(entry));
-
-    // Allocate new, smaller entry; if we can't no big deal
-    if ((new_entry = malloc(sizeof(*entry))) == NULL)
-        goto done;
-    memcpy(new_entry, entry, sizeof(*entry));
-
-    // Update all references that point to the entry
-    s3b_hash_put(priv->hashtable, new_entry);
-    if (ENTRY_IN_LIST(entry)) {
-        TAILQ_REMOVE(cleans_list, entry, link);
-        TAILQ_INSERT_TAIL(cleans_list, new_entry, link);
+    if ((entry = calloc(1, sizeof(*entry))) == NULL)
+        return NULL;
+    if ((r = pthread_rwlock_init(&entry->lock, &priv->rwattr)) != 0) {
+        free(entry);
+        errno = r;
+        return NULL;
     }
-    free(entry);
-    entry = new_entry;
-
-done:
-    // Mark entry as verified
-    entry->verify = 0;
     return entry;
+}
+
+static void
+block_cache_entry_free(struct cache_entry *entry)
+{
+    assert(!ENTRY_BUSY(entry));
+    pthread_rwlock_destroy(&entry->lock);
+    free(entry);
+}
+
+/*
+ * Take a reference on an entry (shared = will read under the entry lock; else will write under it).
+ * A referenced entry is never evicted or freed. Mutex held.
+ */
+static void
+block_cache_entry_ref(struct block_cache_private *priv, struct cache_entry *entry, int shared)
+{
+    assert(ENTRY_GET_STATE(entry) != READING && ENTRY_GET_STATE(entry) != READING2);
+    if (shared) {
+        assert(entry->readers < UINT16_MAX);
+        entry->readers++;
+        priv->num_pins++;
+    } else {
+        assert(entry->excl_waiters < UINT16_MAX);
+        entry->excl_waiters++;
+    }
+    priv->num_refs++;
+}
+
+/*
+ * Drop a reference. The caller has already released the entry lock. Wakes whoever the entry was holding up. Mutex held.
+ */
+static void
+block_cache_entry_unref(struct block_cache_private *priv, struct cache_entry *entry, int shared)
+{
+    if (shared) {
+        assert(entry->readers > 0 && priv->num_pins > 0);
+        entry->readers--;
+        priv->num_pins--;
+    } else {
+        assert(entry->excl_waiters > 0);
+        entry->excl_waiters--;
+    }
+    assert(priv->num_refs > 0);
+    priv->num_refs--;
+    if (priv->num_refs == 0 && priv->unpin_waiters > 0)
+        pthread_cond_broadcast(&priv->unpinned);
+    if (!ENTRY_BUSY(entry) && ENTRY_GET_STATE(entry) == CLEAN) {
+        if (priv->space_pin_waiters > 0)
+            pthread_cond_broadcast(&priv->space_avail);
+        if (priv->clean_timeout != 0 && block_cache_get_time(priv) >= entry->timeout)
+            pthread_cond_signal(&priv->worker_work);
+    }
+}
+
+// A write that took a reference has finished (published its state or given up). Mutex held.
+static void
+block_cache_write_done(struct block_cache_private *priv)
+{
+    assert(priv->pending_writes > 0);
+    if (--priv->pending_writes == 0 && priv->unpin_waiters > 0)
+        pthread_cond_broadcast(&priv->unpinned);
+}
+
+/*
+ * Wait for space: either a CLEAN[2] entry becomes idle or an entry is freed. While we wait because every CLEAN[2]
+ * entry is busy, new hits take no references (see do_read); the last such waiter releases them. Mutex held.
+ */
+static void
+block_cache_wait_space(struct block_cache_private *priv)
+{
+    if (priv->num_cleans > 0) {
+        priv->space_pin_waiters++;
+        pthread_cond_wait(&priv->space_avail, &priv->mutex);
+        if (--priv->space_pin_waiters == 0)
+            pthread_cond_broadcast(&priv->space_avail);
+    } else
+        pthread_cond_wait(&priv->space_avail, &priv->mutex);
+}
+
+/*
+ * Find an expired, idle entry at the front of a CLEAN[2] list (lists are in timeout order).
+ */
+static struct cache_entry *
+block_cache_expired_idle(struct block_cache_private *priv, struct list_head *list, uint32_t now)
+{
+    struct cache_entry *entry;
+
+    (void)priv;
+    for (entry = TAILQ_FIRST(list); entry != NULL && now >= entry->timeout; entry = TAILQ_NEXT(entry, link)) {
+        if (!ENTRY_BUSY(entry))
+            return entry;
+    }
+    return NULL;
 }
 
 /*
@@ -1813,78 +2076,6 @@ block_cache_read_data(struct block_cache_private *priv, struct cache_entry *entr
 
     // Handle on-disk case
     return s3b_dcache_read_block(priv->dcache, entry->u.dslot, dest, off, len);
-}
-
-/*
- * Copy data from a CLEAN entry with the mutex released.
- *
- * This assumes the mutex is held; it is released and reacquired.
- */
-static int
-block_cache_read_pinned(struct block_cache_private *priv, struct cache_entry *entry, void *dest, u_int off, u_int len)
-{
-    struct block_cache_conf *const config = priv->config;
-    const s3b_block_t block_num = entry->block_num;
-    const void *const data = config->cache_file == NULL ? entry->u.data : NULL;
-    const u_int dslot = config->cache_file != NULL ? entry->u.dslot : 0;
-    int r = 0;
-
-    // Sanity check
-    assert(ENTRY_GET_STATE(entry) == CLEAN);
-    assert(entry->excl_waiters == 0);
-    assert(off + len <= config->block_size);
-
-    // Pin entry
-    entry->readers++;
-    priv->num_pins++;
-
-    // Copy data using only the buffer/dslot captured above
-    CHECK_RETURN(pthread_mutex_unlock(&priv->mutex));
-    if (config->cache_file == NULL)
-        memcpy(dest, (const char *)data + off, len);
-    else if (config->read_direct)
-        r = s3b_dcache_read_block_direct(priv->dcache, dslot, dest, off, len);
-    else
-        r = s3b_dcache_read_block(priv->dcache, dslot, dest, off, len);
-    pthread_mutex_lock(&priv->mutex);
-    S3BCACHE_CHECK_INVARIANTS(priv, 1);
-
-    // Pinned entries can't change state, move, or be evicted
-    (void)block_num;
-    assert(s3b_hash_get(priv->hashtable, block_num) == entry);
-    assert(ENTRY_GET_STATE(entry) == CLEAN);
-    assert(entry->readers > 0 && priv->num_pins > 0);
-
-    // Unpin entry (on every return path) and wake anyone it was holding up
-    priv->num_pins--;
-    if (--entry->readers == 0) {
-        if (priv->unpin_waiters > 0)
-            pthread_cond_broadcast(&priv->unpinned);
-        if (priv->space_pin_waiters > 0)
-            pthread_cond_broadcast(&priv->space_avail);
-        if (priv->clean_timeout != 0 && block_cache_get_time(priv) >= entry->timeout)
-            pthread_cond_signal(&priv->worker_work);
-    }
-    return r;
-}
-
-/*
- * Wait until a CLEAN entry has no pinned readers. While we wait, no new pins are granted
- * and the entry can't be evicted. Caller must revalidate everything afterward.
- *
- * This assumes the mutex is held.
- */
-static void
-block_cache_wait_unpinned(struct block_cache_private *priv, struct cache_entry *entry)
-{
-    assert(ENTRY_GET_STATE(entry) == CLEAN);
-    assert(entry->excl_waiters < UINT16_MAX);
-    entry->excl_waiters++;
-    priv->unpin_waiters++;
-    while (entry->readers > 0)
-        pthread_cond_wait(&priv->unpinned, &priv->mutex);
-    priv->unpin_waiters--;
-    entry->excl_waiters--;
 }
 
 /*
@@ -1948,6 +2139,7 @@ struct check_info {
     u_int   num_writing;
     u_int   num_writing2;
     u_int   num_pins;
+    u_int   num_refs;
 };
 
 static void
@@ -1998,6 +2190,7 @@ block_cache_check_invariants(struct block_cache_private *priv, int allow_stoppin
       == s3b_hash_size(priv->hashtable));
     assert(priv->num_dirties == info.num_dirty + info.num_writing + info.num_writing2);
     assert(priv->num_pins == info.num_pins);
+    assert(priv->num_refs == info.num_refs);
 
     // Check read-ahead
     assert(priv->ra_count <= config->read_ahead);
@@ -2010,8 +2203,10 @@ block_cache_check_one(void *arg, void *value)
     struct check_info *const info = arg;
 
     assert(entry != NULL);
-    assert(entry->readers == 0 || ENTRY_GET_STATE(entry) == CLEAN);
+    assert(!ENTRY_BUSY(entry) || (ENTRY_GET_STATE(entry) != READING && ENTRY_GET_STATE(entry) != READING2
+      && ENTRY_GET_STATE(entry) != CLEAN2));
     info->num_pins += entry->readers;
+    info->num_refs += entry->readers + entry->excl_waiters;
     switch (ENTRY_GET_STATE(entry)) {
     case CLEAN:
     case CLEAN2:

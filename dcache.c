@@ -123,6 +123,8 @@ struct dir_entry {
     uint32_t                        flags;
 } __attribute__ ((packed));
 
+#define FILE_SIZE(priv)     __atomic_load_n(&(priv)->file_size, __ATOMIC_ACQUIRE)
+
 // Private structure
 struct s3b_dcache {
     int                             fd;
@@ -134,7 +136,8 @@ struct s3b_dcache {
     u_int                           fadvise;
     uint32_t                        flags;              // copy of file_header.flags
     off_t                           data;
-    off_t                           file_size;
+    off_t                           file_size;          // high-water mark; extended only under size_mutex, read atomically
+    pthread_mutex_t                 size_mutex;         // serializes file-extending data writes (leaf lock)
     u_int                           file_block_size;
     u_int                           free_list_len;
     u_int                           free_list_alloc;
@@ -259,6 +262,7 @@ retry:
         }
     }
     priv->file_size = sb.st_size;
+    pthread_mutex_init(&priv->size_mutex, NULL);
 
     // Get filesystem block size, but if not supported force into a reasonable value
     priv->file_block_size = (u_int)sb.st_blksize;
@@ -465,6 +469,7 @@ s3b_dcache_close(struct s3b_dcache *priv)
     close(priv->fd);
     free(priv->filename);
     free(priv->free_list);
+    pthread_mutex_destroy(&priv->size_mutex);
     free(priv);
 }
 
@@ -729,13 +734,39 @@ s3b_dcache_get_direct_stats(struct s3b_dcache *priv, struct s3b_dcache_direct_st
     stats->buffered = __atomic_load_n(&priv->direct_buffered, __ATOMIC_RELAXED);
 }
 
+static int s3b_dcache_write_block_extend(struct s3b_dcache *priv, u_int dslot, const void *src, u_int off, u_int len);
+
 /*
  * Write data into one dslot.
+ *
+ * Writers of different dslots run concurrently with no lock: pwrite()/fallocate() on disjoint ranges are independent
+ * and the free list is only touched under the caller's (block cache) mutex. The one shared mutable field is the
+ * file size. A write whose dslot lies entirely below the current file size never changes it, so it takes no lock;
+ * one that may extend the file (including the padding of a short final slot) runs under size_mutex so that the
+ * extension and its padding stay consistent. The size only ever grows and is stored/loaded atomically.
  */
 int
 s3b_dcache_write_block(struct s3b_dcache *priv, u_int dslot, const void *src, u_int off, u_int len)
 {
-    const off_t prev_file_size = priv->file_size;
+    int r;
+
+    if (DATA_OFFSET(priv, dslot + 1) <= FILE_SIZE(priv)) {      // entirely inside the file: cannot change the file size
+#if USE_FALLOCATE
+        return s3b_dcache_write_block_falloc(priv, dslot, src, off, len);
+#else
+        return s3b_dcache_write_block_simple(priv, dslot, src, off, len);
+#endif
+    }
+    pthread_mutex_lock(&priv->size_mutex);
+    r = s3b_dcache_write_block_extend(priv, dslot, src, off, len);
+    pthread_mutex_unlock(&priv->size_mutex);
+    return r;
+}
+
+static int
+s3b_dcache_write_block_extend(struct s3b_dcache *priv, u_int dslot, const void *src, u_int off, u_int len)
+{
+    const off_t prev_file_size = FILE_SIZE(priv);
     int r;
 
     // Write the data info the block
@@ -748,16 +779,16 @@ s3b_dcache_write_block(struct s3b_dcache *priv, u_int dslot, const void *src, u_
         return r;
 
     // Keep the file size a proper multiple of one full data block (issue #222)
-    if (priv->file_size > prev_file_size) {
+    if (FILE_SIZE(priv) > prev_file_size) {
 #ifndef NDEBUG
         const off_t dslot_start = DATA_OFFSET(priv, dslot);
 #endif
         const off_t dslot_end = DATA_OFFSET(priv, dslot + 1);
 
-        assert(priv->file_size > dslot_start);
-        assert(priv->file_size <= dslot_end);
-        if (priv->file_size < dslot_end) {
-            const u_int padding_len = (u_int)(dslot_end - priv->file_size);
+        assert(FILE_SIZE(priv) > dslot_start);
+        assert(FILE_SIZE(priv) <= dslot_end);
+        if (FILE_SIZE(priv) < dslot_end) {
+            const u_int padding_len = (u_int)(dslot_end - FILE_SIZE(priv));
             const u_int padding_off = priv->block_size - padding_len;
 
 #if USE_FALLOCATE
@@ -768,7 +799,7 @@ s3b_dcache_write_block(struct s3b_dcache *priv, u_int dslot, const void *src, u_
             if (r != 0)
                 return r;
         }
-        assert(priv->file_size == dslot_end);
+        assert(FILE_SIZE(priv) == dslot_end);
     }
 
     // Done
@@ -827,10 +858,10 @@ s3b_dcache_write_block_falloc(struct s3b_dcache *priv, u_int dslot, const char *
             const u_int zero_len = num_zero_blocks * priv->file_block_size;
 
             // Extend file if necessary
-            if (off + zero_len > priv->file_size) {
+            if (off + zero_len > FILE_SIZE(priv)) {
                 if (fallocate(priv->fd, 0, off, zero_len) != 0)
                     return errno;
-                priv->file_size = off + zero_len;
+                __atomic_store_n(&priv->file_size, off + zero_len, __ATOMIC_RELEASE);
             }
 
             // "Write" zeros using FALLOC_FL_PUNCH_HOLE
@@ -1385,8 +1416,8 @@ s3b_dcache_write2(struct s3b_dcache *priv, int fd, const char *filename, off_t o
               filename, (uintmax_t)chunk_off, strerror(r));
             return r;
         }
-        if (chunk_off + chunk_len > priv->file_size)
-            priv->file_size = chunk_off + chunk_len;
+        if (chunk_off + chunk_len > FILE_SIZE(priv))
+            __atomic_store_n(&priv->file_size, chunk_off + chunk_len, __ATOMIC_RELEASE);
     }
     return 0;
 }
