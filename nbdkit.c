@@ -517,8 +517,9 @@ static int
 s3b_nbd_plugin_block_size(void *handle, uint32_t *minimum, uint32_t *preferred, uint32_t *maximum)
 {
     *minimum = 1;
-    *preferred = config->block_size;
-    *maximum = 0xffffffff;
+    // NBD preferred blocks are limited to 32MiB; backend objects remain unchanged.
+    *preferred = config->block_size > 32U * 1024 * 1024 ? 32U * 1024 * 1024 : config->block_size;
+    *maximum = 64U * 1024 * 1024;
     if (config->file_size < (off_t)*maximum)
         *maximum = (uint32_t)config->file_size;
     return 0;
