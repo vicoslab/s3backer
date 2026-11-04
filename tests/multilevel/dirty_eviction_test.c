@@ -3,6 +3,39 @@ static void de_tick(uint64_t ms) { atomic_fetch_add(&de_clock_offset, ms); }
 static void de_open(u_int size, u_int grace) {
     atomic_store(&de_clock_active, 1); local_mode = 1; de_grace = grace; open_cache(size, 0, 0); REQUIRE(disk);
 }
+// Two foreground allocations must reach distinct real PUTs before either completes.
+// Extra waiters fill the existing pool, without issuing the remaining cold DIRTYs.
+static void case_de_parallel(void) {
+    local_threads = 3; de_open(12, 120000);
+    for (int b = 0; b < 8; b++) { de_tick(1); write_sync(b, 500 + b); }
+    REQUIRE(cache->flush_blocks(cache, NULL, 0, 0) == 0);
+    de_tick(120000);
+    for (int b = 8; b < 12; b++) { de_tick(1); REQUIRE(read_sync(b, 0, BS) == 10 + b); }
+    pthread_mutex_lock(&g_mu); puts_hold = 1; pthread_mutex_unlock(&g_mu);
+    struct op *miss[5];
+    for (int i = 0; i < 2; i++) { miss[i] = reader(12 + i, 0, BS, 0, 0); start(miss[i]); }
+    int concurrent = AWAIT(puts_inflight >= 2, WAIT_MS);
+    printf("pressure-PUT: workers=%u entered=%d inflight=%d completed=%d hot-clean=4\n",
+      cc.num_threads, GET(puts_entered), GET(puts_inflight), GET(puts_completed)); fflush(stdout);
+    REQUIRE(concurrent && GET(puts_completed) == 0);
+    REQUIRE(GET(puts_entered) == 2 && GET(puts_seen[0]) == 1 && GET(puts_seen[1]) == 1);
+    for (int i = 2; i < 5; i++) { miss[i] = reader(12 + i, 0, BS, 0, 0); miss[i]->watched = 1; start(miss[i]); }
+    REQUIRE(AWAIT(puts_inflight == 3 && miss[2]->w.waits && miss[3]->w.waits && miss[4]->w.waits, WAIT_MS));
+    // An unrelated space wake must not select more than the worker pool can handle.
+    pthread_mutex_lock(&P->mutex); pthread_cond_broadcast(&P->space_avail); pthread_mutex_unlock(&P->mutex);
+    REQUIRE(AWAIT(miss[2]->w.waits >= 2 && miss[3]->w.waits >= 2 && miss[4]->w.waits >= 2, WAIT_MS));
+    struct block_cache_stats st; block_cache_get_stats(cache, &st);
+    REQUIRE(st.dirty_eviction_selected == 3 && GET(puts_entered) == 3);
+    for (int b = 0; b < 8; b++) REQUIRE(GET(puts_seen[b]) == (b < 3));
+    pthread_mutex_lock(&g_mu); puts_release = 1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    for (int i = 0; i < 5; i++) { finish(miss[i]); REQUIRE(got(miss[i]) == 22 + i); free(miss[i]); }
+    REQUIRE(GET(puts_peak) <= 3);
+    int before = total_breads();
+    for (int b = 8; b < 17; b++) REQUIRE(read_sync(b, 0, BS) == 10 + b);
+    printf("pressure-PUT: peak=%d second-pass-hot-hits=%d/9\n", GET(puts_peak), 9 - (total_breads() - before)); fflush(stdout);
+    REQUIRE(total_breads() == before);
+    for (int b = 0; b < 8; b++) REQUIRE(read_sync(b, 0, BS) == 500 + b);
+}
 static void de_hog(int enabled) {
     de_open(20, enabled ? 120000 : 0);
     for (int b = 0; b < 16; b++) { de_tick(1); write_sync(b, 500 + b); }
@@ -76,12 +109,13 @@ static void case_de_put_rewrite(void) {
     de_open(4, 120000); de_fill_four(); wgate_open(0);
     struct op *a = reader(4, 0, BS, 0, 0), *b = reader(5, 0, BS, 0, 0);
     a->watched = b->watched = 1; start(a); REQUIRE(AWAIT(wgate_entered == 1, WAIT_MS));
-    start(b); REQUIRE(AWAIT(b->w.waits >= 1, WAIT_MS));
-    REQUIRE(state_of(0) == WRITING); // Both allocators wait; neither owns a naked victim pointer.
+    start(b); finish(b); REQUIRE(got(b) == 15); // A safe CLEAN admission proceeds during the selected PUT.
+    REQUIRE(state_of(0) == WRITING); // The original allocator owns no naked victim pointer.
     write_sync(0, 501); REQUIRE(state_of(0) == WRITING2);
     REQUIRE(cache->flush_blocks(cache, NULL, 0, 0) == 0);
-    REQUIRE(read_sync(0, 0, BS) == 501); wgate_release(); finish(a); finish(b);
+    REQUIRE(read_sync(0, 0, BS) == 501); wgate_release(); finish(a);
     REQUIRE(got(a) == 14 && got(b) == 15); free(a); free(b);
+    wait_state(0, DIRTY); // CLEAN admissions no longer make reader completion a PUT completion barrier.
     REQUIRE(state_of(0) == DIRTY && GET(bwrites[0]) == 1 && GET(bgen[0]) == 500);
     REQUIRE(read_sync(0, 0, BS) == 501); // Successful old PUT did not clean/reuse the newer generation.
     REQUIRE(block_cache_remote_drain(cache, 5000) == 0); REQUIRE(GET(bgen[0]) == 501);
@@ -251,8 +285,8 @@ static void case_de_ra_one(void) {
     REQUIRE(AWAIT(wgate_entered == 1, WAIT_MS));
     REQUIRE(atomic_load(&worker_space_waits)==0);
     struct op *miss=reader(8, 0, BS, 0, 0); miss->watched=1; start(miss);
-    REQUIRE(AWAIT(miss->w.last == &P->space_avail, WAIT_MS));
-    REQUIRE(!GET(miss->done)); wgate_release(); finish(miss); REQUIRE(got(miss)==18);
+    finish(miss); REQUIRE(got(miss)==18); // Remaining CLEANs admit foreground work while the PUT is gated.
+    wgate_release();
     REQUIRE(block_cache_remote_drain(cache, 5000)==0 && GET(bwrites[0])==1);
     close_cache(); free(miss);
 }
@@ -267,8 +301,8 @@ static void case_de_ra_all(void) {
     REQUIRE(AWAIT(wgate_entered==1,WAIT_MS));
     REQUIRE(atomic_load(&worker_space_waits)==0);
     struct op *miss=reader(8,0,BS,0,0); miss->watched=1; start(miss);
-    REQUIRE(AWAIT(miss->w.last==&P->space_avail,WAIT_MS));
-    wgate_release(); finish(miss); REQUIRE(got(miss)==18);
+    finish(miss); REQUIRE(got(miss)==18);
+    wgate_release();
     REQUIRE(block_cache_remote_drain(cache,5000)==0 && GET(bwrites[0])==1);
     close_cache(); free(miss);
 }
@@ -306,3 +340,100 @@ static void case_de_metrics_rewrite(void) {
     de_tick(120000); REQUIRE(read_sync(6,0,BS)==16);
     de_metrics(1,0,1,3); // remote drain already cleaned it; old PUT was never reclamation.
 }
+
+static void case_de_parallel_error(void) {
+    local_threads=3; de_open(8,120000);
+    for (int b=0; b<3; b++) { de_tick(1); write_sync(b,500+b); }
+    de_tick(120000);
+    for (int b=3; b<8; b++) { de_tick(1); REQUIRE(read_sync(b,0,BS)==10+b); }
+    pthread_mutex_lock(&g_mu); puts_hold=1; pthread_mutex_unlock(&g_mu);
+    atomic_store(&backend_fail_block,1);
+    struct op *miss[3];
+    for (int i=0; i<3; i++) { miss[i]=reader(8+i,0,BS,0,0); start(miss[i]); }
+    REQUIRE(AWAIT(puts_inflight==3,WAIT_MS));
+    for (int b=0; b<3; b++) REQUIRE(GET(puts_seen[b])==1);
+    REQUIRE(GET(puts_completed)==0);
+    pthread_mutex_lock(&g_mu); puts_release=1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    for (int i=0; i<3; i++) { finish(miss[i]); REQUIRE(got(miss[i])==18+i); free(miss[i]); }
+    pthread_mutex_lock(&P->mutex);
+    struct cache_entry *failed=s3b_hash_get(P->hashtable,1); REQUIRE(failed);
+    while (P->num_dirties>1 || ENTRY_GET_STATE(failed)!=DIRTY)
+        pthread_cond_wait(&P->write_complete,&P->mutex);
+    pthread_mutex_unlock(&P->mutex);
+    REQUIRE(GET(bwrites[0])==1 && GET(bwrites[1])==0 && GET(bwrites[2])==1);
+    REQUIRE(state_of(1)==DIRTY && read_sync(1,0,BS)==501);
+    de_metrics(3,2,0,3);
+    REQUIRE(cache->flush_blocks(cache,NULL,0,0)==0);
+    REQUIRE(block_cache_remote_drain(cache,5000)==EIO);
+    // A remembered error can return before the retry requested by this drain completes.
+    REQUIRE(AWAIT(puts_seen[1]>=2,WAIT_MS)); wait_state(1,DIRTY);
+    REQUIRE(state_of(1)==DIRTY && read_sync(1,0,BS)==501);
+    atomic_store(&backend_fail_block,-1);
+    int retry=block_cache_remote_drain(cache,5000); REQUIRE(retry==0 || retry==EIO);
+    wait_state(1,CLEAN); REQUIRE(block_cache_remote_drain(cache,5000)==0);
+    REQUIRE(GET(bgen[1])==501); de_metrics(3,2,0,3);
+}
+
+// Park the only worker in a real prefetch, then refresh a selected but unsnapshotted
+// victim. Exactly that selection must be canceled; the next oldest DIRTY reclaims.
+static void de_refresh_selected(int rewrite) {
+#ifdef ML_HAS_DIRTY_EVICTION
+    atomic_store(&de_clock_active,1); local_mode=1; de_grace=120000; local_threads=1;
+    rgate_block=3; open_cache2(4,0,0,0,1); REQUIRE(disk);
+    write_sync(0,500); de_tick(1); write_sync(1,501);
+    REQUIRE(read_sync(1,0,BS)==501); de_tick(1); warm(2);
+    REQUIRE(AWAIT(rgate_entered==1,WAIT_MS)); de_tick(120000);
+    struct op *miss=reader(4,0,BS,0,0); miss->watched=1; start(miss);
+    REQUIRE(AWAIT(miss->w.last==&P->space_avail,WAIT_MS));
+    pthread_mutex_lock(&P->mutex);
+    struct cache_entry *e=s3b_hash_get(P->hashtable,0);
+    REQUIRE(e && e->eviction_upload==1 && ENTRY_GET_STATE(e)==DIRTY);
+    uint64_t written=e->last_write_millis, accessed=e->last_access;
+    P->seq_count=0; // No additional prefetch after the parked request returns.
+    pthread_mutex_unlock(&P->mutex);
+    if (rewrite) write_sync(0,600); else REQUIRE(read_sync(0,0,BS)==500);
+    pthread_mutex_lock(&P->mutex);
+    REQUIRE(e->last_access>accessed && e->eviction_upload==(rewrite ? 2 : 1));
+    REQUIRE(rewrite ? e->last_write_millis>written : e->last_write_millis==written);
+    pthread_mutex_unlock(&P->mutex);
+    rgate_permit_to(1); finish(miss); REQUIRE(got(miss)==14); free(miss);
+    REQUIRE(GET(bwrites[0])==0 && GET(bwrites[1])==1 && state_of(0)==DIRTY);
+    REQUIRE(read_sync(0,0,BS)==(rewrite ? 600 : 500));
+    de_metrics(2,1,rewrite,1);
+    pthread_mutex_lock(&P->mutex); REQUIRE(e->eviction_upload==0); pthread_mutex_unlock(&P->mutex);
+    REQUIRE(block_cache_remote_drain(cache,5000)==0 && GET(bgen[0])==(rewrite ? 600 : 500));
+#else
+    (void)rewrite; REQUIRE(0 && "dirty eviction option absent");
+#endif
+}
+static void case_de_selected_read(void) { de_refresh_selected(0); }
+static void case_de_selected_rewrite(void) { de_refresh_selected(1); }
+
+// A foreground miss wins the fill after workers claim speculative misses. The
+// workers must abandon READING/space waits and remain available for pressure PUTs.
+static void de_ra_reading(int workers) {
+    local_threads=workers; de_open(5,120000);
+    write_sync(0,500); de_tick(1); warm(1); de_tick(1); warm(2);
+    pthread_mutex_lock(&P->mutex);
+    ra_gate_hold=1; cc.read_ahead=workers; cc.read_ahead_trigger=2;
+    P->seq_last=3; P->seq_count=2; P->ra_count=0;
+    pthread_cond_broadcast(&P->worker_work); pthread_mutex_unlock(&P->mutex);
+    REQUIRE(AWAIT(ra_gate_entered==workers,WAIT_MS));
+    pthread_mutex_lock(&g_mu); rgate_block=4; pthread_mutex_unlock(&g_mu);
+    struct op *owner=reader(4,0,BS,0,0); start(owner);
+    REQUIRE(AWAIT(rgate_entered==1,WAIT_MS)); // Foreground owns READING(4).
+    warm(3); de_tick(120000);
+    for (int b=1; b<4; b++) { de_tick(1); REQUIRE(read_sync(b,0,BS)==cached[b]); }
+    wgate_open(0);
+    struct op *miss=reader(8,0,BS,0,0); miss->watched=1; start(miss);
+    REQUIRE(AWAIT(miss->w.last==&P->space_avail,WAIT_MS));
+    pthread_mutex_lock(&g_mu); ra_gate_release=1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    REQUIRE(AWAIT(wgate_entered==1,WAIT_MS)); // PUT progress while READING(4) is still gated.
+    REQUIRE(atomic_load(&worker_space_waits)==0 && atomic_load(&worker_reading_waits)==0);
+    rgate_permit_to(1); wgate_release(); finish(owner); finish(miss);
+    REQUIRE(got(owner)==14 && got(miss)==18); free(owner); free(miss);
+    REQUIRE(block_cache_remote_drain(cache,5000)==0 && GET(bwrites[0])==1);
+    close_cache();
+}
+static void case_de_ra_reading_one(void) { de_ra_reading(1); }
+static void case_de_ra_reading_all(void) { de_ra_reading(3); }

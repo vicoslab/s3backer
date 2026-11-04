@@ -214,7 +214,7 @@ struct block_cache_flush_waiter {
 // Private data
 struct block_cache_private {
     uint64_t                        access_sequence;
-    u_int                           eviction_pending; // one age-selected upload; allocators rescan after wakeup
+    u_int                           eviction_uploads; // selected uploads, bounded by the existing worker pool
     struct block_cache_conf         *config;        // configuration
     struct s3backer_store           *inner;         // underlying s3backer store
     struct block_cache_stats        stats;          // statistics
@@ -307,7 +307,7 @@ static int block_cache_high_prio(struct block_cache_conf *conf, s3b_block_t bloc
 static uint32_t block_cache_get_time(struct block_cache_private *priv);
 static uint64_t block_cache_get_time_millis(void);
 static uint64_t block_cache_monotonic_millis(void);
-static struct cache_entry *block_cache_eviction_candidate(struct block_cache_private *priv);
+static struct cache_entry *block_cache_eviction_candidate(struct block_cache_private *priv, struct cache_entry *selected);
 static void block_cache_eviction_done(struct block_cache_private *priv, struct cache_entry *entry);
 static int block_cache_read_data(struct block_cache_private *priv, struct cache_entry *entry, void *dest, u_int off, u_int len);
 static struct cache_entry *block_cache_first_idle(struct list_head *list);
@@ -1793,20 +1793,19 @@ again:
         if (config->dirty_eviction_grace) {
             // No entry pointer survives a wait. The worker owns the DIRTY/WRITING lifetime;
             // after every wake the caller restarts its hash lookup and candidate selection.
-            if (priv->eviction_pending) {
-                if (!can_wait) { entry = NULL; goto done; }
-                pthread_cond_wait(&priv->space_avail, &priv->mutex);
-                return BLOCK_CACHE_RETRY;
-            }
-            entry = block_cache_eviction_candidate(priv);
+            entry = block_cache_eviction_candidate(priv, NULL);
             if (entry && ENTRY_GET_STATE(entry) == DIRTY) {
-                entry->eviction_upload = 1;
-                priv->stats.dirty_eviction_selected++;
-                priv->eviction_pending = 1;
-                TAILQ_REMOVE(&priv->dirties, entry, link);
-                TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
-                entry->timeout = block_cache_get_time(priv); // existing pressure wakeup, never an age timer
-                pthread_cond_signal(&priv->worker_work);
+                // Reserve at most one victim per worker, even after unrelated space wakeups.
+                // This bound applies only to DIRTY selection; a safe CLEAN admission can proceed.
+                if (priv->eviction_uploads < priv->num_threads) {
+                    entry->eviction_upload = 1;
+                    priv->stats.dirty_eviction_selected++;
+                    priv->eviction_uploads++;
+                    TAILQ_REMOVE(&priv->dirties, entry, link);
+                    TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
+                    entry->timeout = block_cache_get_time(priv); // existing pressure wakeup, never an age timer
+                    pthread_cond_signal(&priv->worker_work);
+                }
                 if (!can_wait) { entry = NULL; goto done; }
                 pthread_cond_wait(&priv->space_avail, &priv->mutex);
                 return BLOCK_CACHE_RETRY;
@@ -1860,10 +1859,12 @@ done:
  * Scan the existing lists: no additional list, lock or persistent metadata. Busy
  * entries and previous upload errors are skipped; the original all-dirty space
  * fallback still forces progress even when every dirty block is younger than grace.
+ * Reservations are excluded from new selections. A worker passes its own selected
+ * entry to revalidate its recency/age without competing with other reservations.
  * All fields and returned pointers are used only under the housekeeping mutex.
  */
 static struct cache_entry *
-block_cache_eviction_candidate(struct block_cache_private *priv)
+block_cache_eviction_candidate(struct block_cache_private *priv, struct cache_entry *selected)
 {
     struct cache_entry *entry, *best = NULL;
     const uint64_t now = block_cache_monotonic_millis();
@@ -1873,7 +1874,8 @@ block_cache_eviction_candidate(struct block_cache_private *priv)
             best = entry;
     }
     TAILQ_FOREACH(entry, &priv->dirties, link) {
-        if (!ENTRY_BUSY(entry) && !entry->write_error && now >= entry->last_write_millis
+        if ((!entry->eviction_upload || entry == selected)
+          && !ENTRY_BUSY(entry) && !entry->write_error && now >= entry->last_write_millis
           && now - entry->last_write_millis >= priv->config->dirty_eviction_grace
           && (!best || entry->last_access < best->last_access))
             best = entry;
@@ -1885,9 +1887,9 @@ static void
 block_cache_eviction_done(struct block_cache_private *priv, struct cache_entry *entry)
 {
     if (entry->eviction_upload) {
-        assert(priv->eviction_pending == 1);
+        assert(priv->eviction_uploads > 0);
         entry->eviction_upload = 0;
-        priv->eviction_pending = 0;
+        priv->eviction_uploads--;
         pthread_cond_broadcast(&priv->space_avail);
     }
 }
@@ -2005,7 +2007,7 @@ block_cache_worker_main(void *arg)
         // A read or successful rewrite between selection and worker admission can change the victim.
         // Cancel before taking a snapshot; once WRITING, the existing rewrite protocol owns it.
         entry = TAILQ_FIRST(&priv->dirties);
-        if (priv->eviction_pending) {
+        if (priv->eviction_uploads) {
             struct cache_entry *selected;
 
             // A barrier can reorder the queue. Do not strand the selected request behind a failed head.
@@ -2014,7 +2016,7 @@ block_cache_worker_main(void *arg)
             }
         }
         if (entry && entry->eviction_upload && !priv->draining && !priv->stopping
-          && priv->flush_waiters == NULL && block_cache_eviction_candidate(priv) != entry) {
+          && priv->flush_waiters == NULL && block_cache_eviction_candidate(priv, entry) != entry) {
             entry->timeout = READING_TIMEOUT;
             block_cache_eviction_done(priv, entry);
             continue;

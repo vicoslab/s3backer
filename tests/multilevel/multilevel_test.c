@@ -52,7 +52,7 @@ static __thread struct gate *tl_gate;
 static __thread struct watch *tl_watch;
 static __thread int tl_sync_allowed;
 static __thread int tl_test;                    // created by this test, not a cache worker
-static atomic_uint worker_waits, worker_space_waits;
+static atomic_uint worker_waits, worker_space_waits, worker_reading_waits;
 static int disk;
 static int local_mode;
 static u_int de_grace;
@@ -96,6 +96,9 @@ static int mixed_active;
 static unsigned char mixed_expected[BS];
 static atomic_uint direct_calls;
 static int wgate_block = -1, wgate_entered, wgate_permit;
+// Gate every real backend PUT, before either success or injected failure.
+static int puts_hold, puts_release, puts_entered, puts_inflight, puts_peak, puts_completed;
+static int puts_seen[NB];
 static int ra_gate_hold, ra_gate_entered, ra_gate_release; // park all workers at a speculative miss
 static int rgate_block = -1, rgate_entered, rgate_permit, rgate_fail;   // backend read gate: call k proceeds when rgate_permit >= k; call 1 fails if rgate_fail
 
@@ -216,6 +219,7 @@ static void observe(pthread_cond_t *c, pthread_mutex_t *m) {
     else if (!tl_test) {
         atomic_fetch_add(&worker_waits, 1);
         if (P && c == &P->space_avail) atomic_fetch_add(&worker_space_waits, 1);
+        if (P && c == &P->end_reading) atomic_fetch_add(&worker_reading_waits, 1);
     }
 }
 int __wrap_pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) { observe(c, m); return __real_pthread_cond_wait(c, m); }
@@ -262,9 +266,19 @@ static int be_read(struct s3backer_store *s, s3b_block_t b, void *dst, u_char *t
 }
 static int be_write(struct s3backer_store *s, s3b_block_t b, const void *src, u_char *tag, check_cancel_t *cancel, void *arg) {
     (void)s; (void)cancel; (void)arg;
-    if (atomic_load(&backend_fail) || (int)b == atomic_load(&backend_fail_block)) return EIO;
     int gen = src != NULL ? decode(src, b, 0, BS) : -1;
     pthread_mutex_lock(&g_mu);
+    if (puts_hold) {
+        puts_entered++; puts_seen[b]++; puts_inflight++;
+        if (puts_inflight > puts_peak) puts_peak = puts_inflight;
+        pthread_cond_broadcast(&g_cv);
+        while (!puts_release) pthread_cond_wait(&g_cv, &g_mu);
+        puts_inflight--; puts_completed++;
+        pthread_cond_broadcast(&g_cv);
+    }
+    if (atomic_load(&backend_fail) || (int)b == atomic_load(&backend_fail_block)) {
+        pthread_mutex_unlock(&g_mu); return EIO;
+    }
     if (mixed_active && b == 0) { REQUIRE(src && memcmp(src, mixed_expected, BS) == 0); gen = 900; }
     REQUIRE(gen > 0);                           // worker snapshot must be one whole generation
     if ((int)b == wgate_block) { wgate_entered++; pthread_cond_broadcast(&g_cv); while (!wgate_permit) pthread_cond_wait(&g_cv, &g_mu); }
@@ -1427,6 +1441,10 @@ static void case_lf_alloc_terminal(void) {
 
 int main(int argc, char **argv) {
     static const struct { const char *name; void (*fn)(void); } cases[] = {
+        { "de-parallel", case_de_parallel },
+        { "de-parallel-error", case_de_parallel_error },
+        { "de-selected-read", case_de_selected_read }, { "de-selected-rewrite", case_de_selected_rewrite },
+        { "de-ra-reading-one", case_de_ra_reading_one }, { "de-ra-reading-all", case_de_ra_reading_all },
         { "de-metrics", case_de_metrics }, { "de-metrics-off", case_de_metrics_off },
         { "de-metrics-rewrite", case_de_metrics_rewrite },
         { "de-ra-one", case_de_ra_one }, { "de-ra-all", case_de_ra_all },

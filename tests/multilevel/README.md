@@ -49,6 +49,32 @@ rewrite invalidation and default-off behavior. Gated read-ahead/drain tests cove
 drain retaining its upload request and a barrier reordering a selected victim
 behind a different failed block. Run with `--suites dirty,local,ml,flush,order,direct,pins`.
 
+Parallel pressure reclaim reuses the normal upload workers and dirty list. New
+selections skip reserved entries; reservations are bounded by the live worker
+count, and do not prevent safe CLEAN admissions. Workers revalidate their own
+reservation against unreserved candidates before taking a snapshot.
+`de-parallel` gates every backend PUT with a pthread condition: two foreground
+misses must reach two distinct oldest victims before any completion. Five
+waiters then fill the three-worker pool; even an unrelated space wake must not
+select a fourth victim while it is full. After release it checks every foreground
+payload and requires all nine hot-set accesses to hit without a backend GET.
+The starting commit bdc6d0a fails both direct variants with exactly one inflight
+PUT and zero completions. `de-parallel-error` fails one of three concurrent PUTs,
+checks the other successes, exact policy counters, retained DIRTY contents and
+explicit drain errors/recovery. `de-selected-read`/`de-selected-rewrite` park the
+worker before snapshot and assert exact cancellation counters and write-age
+semantics. `de-ra-reading-one`/`de-ra-reading-all` let a foreground fill win a
+claimed speculative miss, proving PUT progress while that entry is still
+READING; workers must never wait on `end_reading` or `space_avail`.
+The existing rewrite and read-ahead tests now require foreground CLEAN
+admissions to complete while the selected PUT remains gated.
+
+The unmodified legacy `worker-flush` cases (including their adapted ml copies)
+have a known completion-observation timing gap: backend completion can precede
+the worker's final CLEAN transition/flush call. Keep any such failures and their
+logs in the receipt; do not retry them into a passing result. The three
+`pins-superseded` cases remain separately reported as described above.
+
 The harness uses `<config.h>` so the runner's generated header wins over the
 checked-in header. Assertion variants define `ML_EXPECT_ASSERTIONS` and fail to
 compile if NDEBUG is active; `TEST-START` also prints `assertions=on/off`. This

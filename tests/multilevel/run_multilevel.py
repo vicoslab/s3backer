@@ -134,7 +134,7 @@ def main():
             if only and case not in only: return
             jobs.append((b / binary, case, label, use_disk))
         if 'dirty' in suites:
-            for c in ['de-ra-one', 'de-ra-all', 'de-metrics', 'de-metrics-off', 'de-metrics-rewrite', 'de-hog', 'de-default', 'de-shared', 'de-rewrite', 'de-read-recency', 'de-idle', 'de-young', 'de-put-rewrite', 'de-upload-error', 'de-busy-dirty', 'de-busy-clean', 'de-config', 'de-crash', 'de-stress', 'de-boundary', 'de-restart-grace', 'de-snapshot-error', 'de-drain-selected', 'de-reordered-error', 'de-put-shutdown']:
+            for c in ['de-parallel', 'de-parallel-error', 'de-selected-read', 'de-selected-rewrite', 'de-ra-reading-one', 'de-ra-reading-all', 'de-ra-one', 'de-ra-all', 'de-metrics', 'de-metrics-off', 'de-metrics-rewrite', 'de-hog', 'de-default', 'de-shared', 'de-rewrite', 'de-read-recency', 'de-idle', 'de-young', 'de-put-rewrite', 'de-upload-error', 'de-busy-dirty', 'de-busy-clean', 'de-config', 'de-crash', 'de-stress', 'de-boundary', 'de-restart-grace', 'de-snapshot-error', 'de-drain-selected', 'de-reordered-error', 'de-put-shutdown']:
                 add('ml-test', c, f'dirty/disk-rd0/{c}', True)
                 add('ml-test-rd1', c, f'dirty/disk-rd1/{c}', True)
         if 'local' in suites:
