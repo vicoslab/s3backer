@@ -11,10 +11,11 @@ baseline RED are retained.
 
 | Final matrix | Required cells | Result |
 | --- | ---: | --- |
-| Production assertions | 273 | all pass |
-| Optimized / NDEBUG | 273 | all pass |
-| ASAN + UBSAN / assertions | 273 | all pass |
-| TSan / assertions | 273 | startup unsupported; not a clean race result |
+| Production assertions | 283 | 282 pass; one legacy assertion failure, isolated recheck passes |
+| Optimized / NDEBUG | 283 | all pass |
+| ASAN + UBSAN / assertions | 283 | all pass |
+| Prior TSan / assertions | 273 | 96 pass, 177 startup nonpasses; not a clean race result |
+| Correction TSan / assertions | 10 | 5 pass, 5 mapping startup nonpasses; not a clean race result |
 | Public option parser | 10 | all pass |
 
 Nine unmodified, superseded old-lock harness cells per matrix variant are
@@ -34,13 +35,43 @@ Two additional drain races were reproduced RED before their fixes. The existing
 Reproduce (output directory must be new):
 
 ```sh
-python -I tests/multilevel/run_multilevel.py --out /NODE_LOCAL/new-native-run \
-  --deps /PREFIX/with/include-and-lib --variants cand-assert,cand-opt,cand-asan,cand-tsan \
+python -I tests/multilevel/run_multilevel.py --out "$PWD/native-validation-new" \
+  --deps "$DEPS_PREFIX" --variants cand-assert,cand-opt,cand-asan,cand-tsan \
   --suites dirty,local,ml,flush,order,direct,pins --case-timeout 25 --budget 1000 --jobs 6
 ```
 
-Exact source/test hashes, compiler flags, commands, outcomes, patch stack,
-host-plugin hash and raw evidence paths are in the node-local
-`/var/tmp/nfs-execution/s3backer-dirty-eviction-grace-20261103/implementation-handoff.json`
-and its linked manifests. Public parser checks use the real configuration parser
-in parse-only mode. Native checks do not establish deployment or VM durability.
+The 283 required cells retain all 273 prior cases and add ten buffered/direct
+correction cells. All ten new cells pass in each primary variant. The assertion
+matrix retains a failure in the unmodified `read-pins/disk-rd0/worker-flush` case;
+an isolated execution of the same binary passes. A controlled backend-return
+delay exposes the same legacy test timing gap on both reviewed and corrected
+source: its post-snapshot write can still be WRITING when the test expects CLEAN.
+Twenty diagnostic runs without that delay pass on each source. Those diagnostics
+and the isolated recheck do not replace the original failing matrix result.
+
+The one-worker and all-three-workers read-ahead cases failed
+on the reviewed source when no selected-victim PUT started within five seconds.
+The corrected speculative allocator abandons a fill instead of waiting for an
+upload from its own pool, including across allocation retries and the pressure
+fallback. Foreground allocation still waits. The all-worker test gates existing
+read-ahead hash lookups so every worker reaches a speculative miss before any
+can return to upload scheduling.
+
+The stats mirror exports four counters through the existing stats printer:
+
+| Counter (prefix `block_cache_`) | Meaning |
+| --- | --- |
+| `dirty_eviction_selected` | Pressure selected an age-eligible DIRTY generation. |
+| `dirty_eviction_uploaded` | That selected generation completed its PUT and became CLEAN. This does not promise its subsequent eviction. |
+| `dirty_eviction_rewrite_canceled` | A successful rewrite invalidated a selection, counted once per selection. An older successful PUT cannot count the newer generation as reclaimed. |
+| `dirty_eviction_clean` | Pressure selected an idle CLEAN or CLEAN2 entry for eviction while the policy was enabled, including an erase attempt that subsequently fails. Timeout evictions are excluded. |
+
+All four counters are zero with the policy disabled and reset through the
+existing stats-clear operation. Selections and completions can span a reset.
+Real-C assertions cover successful and failed selected uploads, rewrite during
+PUT, stats reset, CLEAN eviction, and option-off behavior.
+
+Exact source/test hashes, commands, raw logs and plugin identities belong in the
+external validation handoff supplied with a build. Public parser checks use the
+real configuration parser in parse-only mode. Native checks do not establish
+deployment or VM durability.

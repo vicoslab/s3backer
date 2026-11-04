@@ -67,6 +67,10 @@ struct block_cache_stats {
     uint64_t            drain_errors;
     int                 drain_error;
     int                 local_error;
+    uint64_t            dirty_eviction_selected; // pressure selected an old DIRTY generation
+    uint64_t            dirty_eviction_uploaded; // selected generation uploaded and became CLEAN
+    uint64_t            dirty_eviction_rewrite_canceled; // successful rewrite invalidated a selection (once)
+    uint64_t            dirty_eviction_clean; // pressure CLEAN[2] eviction attempts with policy enabled
     u_int               initial_size;
     u_int               current_size;
     double              dirty_ratio;

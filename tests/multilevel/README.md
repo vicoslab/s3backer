@@ -40,7 +40,12 @@ shared recency, rewrite grace, read recency without grace reset, exact boundarie
 beyond 32-bit time, idle zero PUTs, young-dirty pressure progress, two allocators
 waiting during a victim PUT and rewrite, upload/snapshot errors, busy references,
 invalid configurations, SIGKILL/LOCAL_ACK recovery with a fresh grace interval,
-drain/shutdown and concurrent stress. Gated read-ahead/drain tests cover a later
+drain/shutdown and concurrent stress. `de-ra-one` gates a real worker prefetch;
+`de-ra-all` gates the outer speculative hash lookup until all three workers have
+claimed misses. Both require PUT, foreground allocation, drain and shutdown
+progress with an old DIRTY victim and newer CLEAN entries. Workers may not wait
+on `space_avail`. `de-metrics*` assert policy counters, reset, upload failure,
+rewrite invalidation and default-off behavior. Gated read-ahead/drain tests cover a later
 drain retaining its upload request and a barrier reordering a selected victim
 behind a different failed block. Run with `--suites dirty,local,ml,flush,order,direct,pins`.
 

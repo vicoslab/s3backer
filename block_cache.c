@@ -164,7 +164,7 @@ struct cache_entry {
     int                             write_error;    // last failed writeback, cleared on success
     uint64_t                        last_write_millis; // monotonic, RAM only; grace restarts on recovery
     uint64_t                        last_access;    // shared CLEAN/DIRTY recency sequence, mutex protected
-    u_int                           eviction_upload; // pressure request owned by the worker, never an allocator pointer
+    u_int                           eviction_upload; // 1: selected generation; 2: invalidated by rewrite; worker owns lifetime
     u_int                           dirty:1;        // indicates state DIRTY or WRITING2
     u_int                           verify:1;       // data should be verified first
     uint32_t                        timeout:30;     // when to evict (CLEAN[2]) or write (DIRTY)
@@ -285,11 +285,11 @@ static s3b_dcache_visit_t block_cache_dcache_load;
 static s3b_hash_visit_t block_cache_append_block_list;
 static void block_cache_write_failed(struct block_cache_private *priv, struct cache_entry *entry, int error);
 static int block_cache_read(struct block_cache_private *priv, s3b_block_t block_num, u_int off, u_int len, void *dest);
-static int block_cache_do_read(struct block_cache_private *priv, s3b_block_t block_num, u_int off, u_int len, void *dest, int stats);
+static int block_cache_do_read(struct block_cache_private *priv, s3b_block_t block_num, u_int off, u_int len, void *dest, int stats, int speculative);
 static int block_cache_write(struct block_cache_private *priv, s3b_block_t block_num, u_int off, u_int len, const void *src);
 static void *block_cache_worker_main(void *arg);
 static int block_cache_check_cancel(void *arg, s3b_block_t block_num);
-static int block_cache_get_entry(struct block_cache_private *priv, struct cache_entry **entryp, void **datap);
+static int block_cache_get_entry(struct block_cache_private *priv, struct cache_entry **entryp, void **datap, int can_wait);
 static void block_cache_free_entry(struct block_cache_private *priv, struct cache_entry *entry);
 static struct cache_entry *block_cache_entry_alloc(struct block_cache_private *priv);
 static void block_cache_entry_free(struct cache_entry *entry);
@@ -1135,7 +1135,7 @@ block_cache_read(struct block_cache_private *const priv, s3b_block_t block_num, 
         pthread_cond_signal(&priv->worker_work);
 
     // Peform the read
-    r = block_cache_do_read(priv, block_num, off, len, dest, 1);
+    r = block_cache_do_read(priv, block_num, off, len, dest, 1, 0);
     block_cache_op_done(priv);
 
 done:
@@ -1151,12 +1151,13 @@ done:
  * or the lower layer is accessed.
  */
 static int
-block_cache_do_read(struct block_cache_private *const priv, s3b_block_t block_num, u_int off, u_int len, void *dest, int stats)
+block_cache_do_read(struct block_cache_private *const priv, s3b_block_t block_num, u_int off, u_int len, void *dest, int stats, int speculative)
 {
     struct block_cache_conf *const config = priv->config;
     struct list_head *const cleans_list = block_cache_cleans_list(priv, block_num);
     struct cache_entry *entry;
     u_char etag[MD5_DIGEST_LENGTH];
+    const int can_wait = !speculative || !config->dirty_eviction_grace;
     int verified_but_not_read = 0;
     int erase_first = 0;
     int was_verify = 0;
@@ -1179,6 +1180,7 @@ again:
         switch (ENTRY_GET_STATE(entry)) {
         case READING:       // Wait for other thread already reading this block to finish
         case READING2:
+            if (!can_wait) return EAGAIN;
             pthread_cond_wait(&priv->end_reading, &priv->mutex);
             goto again;
         case CLEAN2:        // Go into READING2 state to read/verify the data (CLEAN2 entries are always idle)
@@ -1208,6 +1210,7 @@ again:
         case CLEAN:
             // While an allocator waits because every CLEAN[2] entry is busy, take no new reference
             if (priv->space_pin_waiters > 0) {
+                if (!can_wait) return EAGAIN;
                 pthread_cond_wait(&priv->space_avail, &priv->mutex);
                 goto again;
             }
@@ -1260,12 +1263,13 @@ again:
     }
 
     // Create a new cache entry in state READING
-    if ((r = block_cache_get_entry(priv, &entry, &data)) != 0) {
+    if ((r = block_cache_get_entry(priv, &entry, &data, can_wait)) != 0) {
         if (r == BLOCK_CACHE_RETRY)
             goto again;
         return r;
     }
     if (entry == NULL) {                                            // no free entries right now
+        if (!can_wait) return EAGAIN; // Give speculative workers back to the upload pool, including after retries.
         struct cache_entry *dirty_entry = TAILQ_FIRST(&priv->dirties);
 
         // Write the next dirty block, if any, ahead of schedule to free up space
@@ -1486,7 +1490,7 @@ again:
             // A torn CLEAN record can contain a stale identity. Verification must precede
             // a DIRTY marker even for a full overwrite (crash may precede its payload).
             if (config->local_flush) {
-                if ((r = block_cache_do_read(priv, block_num, 0, 0, NULL, 0)) != 0) goto fail;
+                if ((r = block_cache_do_read(priv, block_num, 0, 0, NULL, 0, 0)) != 0) goto fail;
                 goto again;
             }
             // convert to CLEAN (CLEAN2 entries are idle, the entry does not move), then proceed
@@ -1572,6 +1576,10 @@ again:
         if (config->dirty_eviction_grace) {
             // Publish the successful write time before any later writer or uploader can acquire the entry lock.
             if (!r) {
+                if (entry->eviction_upload == 1) {
+                    priv->stats.dirty_eviction_rewrite_canceled++;
+                    entry->eviction_upload = 2; // An older PUT must never count as reclaiming this generation.
+                }
                 entry->last_write_millis = block_cache_monotonic_millis();
                 entry->last_access = ++priv->access_sequence;
             }
@@ -1592,7 +1600,7 @@ again:
      * we have to read it into the cache first.
      */
     if (off != 0 || len != config->block_size) {
-        if ((r = block_cache_do_read(priv, block_num, 0, 0, NULL, 0)) != 0)
+        if ((r = block_cache_do_read(priv, block_num, 0, 0, NULL, 0, 0)) != 0)
             goto fail;
         if (partial_miss++ == 0)
             priv->stats.write_misses++;
@@ -1607,7 +1615,7 @@ again:
     }
 
     // Get a cache entry, evicting a CLEAN[2] entry if necessary
-    if ((r = block_cache_get_entry(priv, &entry, NULL)) != 0) {
+    if ((r = block_cache_get_entry(priv, &entry, NULL, 1)) != 0) {
         if (r == BLOCK_CACHE_RETRY)
             goto again;
         goto fail;
@@ -1743,7 +1751,9 @@ block_cache_write_failed(struct block_cache_private *priv, struct cache_entry *e
  * Acquire a new cache entry. If the cache is full, and there is at least one
  * idle CLEAN[2] entry, evict it. Opt-in age selection can instead request a DIRTY
  * upload and return RETRY after waiting, without retaining a victim pointer.
- * Otherwise, return NULL entry for the existing pressure fallback.
+ * With can_wait false, return NULL instead of waiting for an upload; speculative
+ * callers must abandon the fill, including after RETRY. Otherwise return NULL
+ * for the existing foreground pressure fallback.
  *
  * On successful return, *datap will point to a malloc'd buffer for the data. If using
  * the disk cache, this will be a temporary buffer, otherwise it's the in-memory buffer.
@@ -1755,7 +1765,7 @@ block_cache_write_failed(struct block_cache_private *priv, struct cache_entry *e
  * Returns non-zero on error.
  */
 static int
-block_cache_get_entry(struct block_cache_private *priv, struct cache_entry **entryp, void **datap)
+block_cache_get_entry(struct block_cache_private *priv, struct cache_entry **entryp, void **datap, int can_wait)
 {
     struct block_cache_conf *const config = priv->config;
     struct cache_entry *entry;
@@ -1784,17 +1794,20 @@ again:
             // No entry pointer survives a wait. The worker owns the DIRTY/WRITING lifetime;
             // after every wake the caller restarts its hash lookup and candidate selection.
             if (priv->eviction_pending) {
+                if (!can_wait) { entry = NULL; goto done; }
                 pthread_cond_wait(&priv->space_avail, &priv->mutex);
                 return BLOCK_CACHE_RETRY;
             }
             entry = block_cache_eviction_candidate(priv);
             if (entry && ENTRY_GET_STATE(entry) == DIRTY) {
                 entry->eviction_upload = 1;
+                priv->stats.dirty_eviction_selected++;
                 priv->eviction_pending = 1;
                 TAILQ_REMOVE(&priv->dirties, entry, link);
                 TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
                 entry->timeout = block_cache_get_time(priv); // existing pressure wakeup, never an age timer
                 pthread_cond_signal(&priv->worker_work);
+                if (!can_wait) { entry = NULL; goto done; }
                 pthread_cond_wait(&priv->space_avail, &priv->mutex);
                 return BLOCK_CACHE_RETRY;
             }
@@ -1802,6 +1815,8 @@ again:
             entry = block_cache_first_idle(&priv->hi_cleans);
         if (!entry)
             goto done;
+        if (config->dirty_eviction_grace)
+            priv->stats.dirty_eviction_clean++;
         block_cache_free_entry(priv, entry);
         if (config->cache_file != NULL)
             return BLOCK_CACHE_RETRY;
@@ -2107,6 +2122,9 @@ block_cache_worker_main(void *arg)
                 }
             }
 
+            // Count only a successful, still-selected generation that can become CLEAN.
+            if (entry->eviction_upload == 1 && !entry->dirty)
+                priv->stats.dirty_eviction_uploaded++;
             // If block was not modified while being written (WRITING), it is now CLEAN
             block_cache_eviction_done(priv, entry);
             if (!entry->dirty) {
@@ -2165,7 +2183,7 @@ block_cache_worker_main(void *arg)
                     pthread_cond_signal(&priv->worker_work);
 
                 // Perform a speculative read of the block so it will get stored in the cache
-                (void)block_cache_do_read(priv, ra_block, 0, 0, NULL, 0);
+                (void)block_cache_do_read(priv, ra_block, 0, 0, NULL, 0, 1);
                 break;
             }
             continue;

@@ -1136,6 +1136,9 @@ s3b_config_print_stats(void *prarg, printer_t *printer)
         (*printer)(prarg, "block_cache_local_flush %u\nblock_cache_drain_pid %u\nblock_cache_drain_start_ticks %ju\nblock_cache_drain_requested %ju\nblock_cache_drain_completed %ju\nblock_cache_drain_errors %ju\nblock_cache_drain_error %d\nblock_cache_local_error %d\n",
           block_cache_stats.local_flush, block_cache_stats.drain_pid, (uintmax_t)block_cache_stats.drain_start_ticks, (uintmax_t)block_cache_stats.drain_requested,
           (uintmax_t)block_cache_stats.drain_completed, (uintmax_t)block_cache_stats.drain_errors, block_cache_stats.drain_error, block_cache_stats.local_error);
+        (*printer)(prarg, "block_cache_dirty_eviction_selected %ju\nblock_cache_dirty_eviction_uploaded %ju\nblock_cache_dirty_eviction_rewrite_canceled %ju\nblock_cache_dirty_eviction_clean %ju\n",
+          (uintmax_t)block_cache_stats.dirty_eviction_selected, (uintmax_t)block_cache_stats.dirty_eviction_uploaded,
+          (uintmax_t)block_cache_stats.dirty_eviction_rewrite_canceled, (uintmax_t)block_cache_stats.dirty_eviction_clean);
         total_reads = block_cache_stats.read_hits + block_cache_stats.read_misses;
         if (total_reads != 0)
             read_hit_ratio = (double)block_cache_stats.read_hits / (double)total_reads;

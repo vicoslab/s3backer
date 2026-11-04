@@ -238,3 +238,71 @@ static void case_de_put_shutdown(void) {
     REQUIRE(P->num_dirties == 0 && P->num_refs == 0);
     cache->destroy(cache); cache=NULL; free(miss); free(shutdown);
 }
+
+// Hold the real worker in a backend prefetch while filling its remaining slot.
+// On release its next speculative miss must hand the selected DIRTY back to the pool.
+static void case_de_ra_one(void) {
+    atomic_store(&de_clock_active, 1); local_mode=1; de_grace=120000; local_threads=1;
+    rgate_block=3; open_cache2(4, 0, 0, 0, 1); REQUIRE(disk);
+    write_sync(0, 500); de_tick(1); warm(1); de_tick(1); warm(2);
+    REQUIRE(AWAIT(rgate_entered == 1, WAIT_MS));
+    rgate_permit_to(1); wait_state(3, CLEAN); de_tick(120000); wgate_open(0);
+    REQUIRE(read_sync(2, 0, BS) == 12); REQUIRE(read_sync(3, 0, BS) == 13);
+    REQUIRE(AWAIT(wgate_entered == 1, WAIT_MS));
+    REQUIRE(atomic_load(&worker_space_waits)==0);
+    struct op *miss=reader(8, 0, BS, 0, 0); miss->watched=1; start(miss);
+    REQUIRE(AWAIT(miss->w.last == &P->space_avail, WAIT_MS));
+    REQUIRE(!GET(miss->done)); wgate_release(); finish(miss); REQUIRE(got(miss)==18);
+    REQUIRE(block_cache_remote_drain(cache, 5000)==0 && GET(bwrites[0])==1);
+    close_cache(); free(miss);
+}
+static void case_de_ra_all(void) {
+    local_threads=3; de_open(4,120000); de_fill_four(); wgate_open(0);
+    pthread_mutex_lock(&P->mutex);
+    ra_gate_hold=1; cc.read_ahead=3; cc.read_ahead_trigger=2;
+    P->seq_last=3; P->seq_count=2; P->ra_count=0;
+    pthread_cond_broadcast(&P->worker_work); pthread_mutex_unlock(&P->mutex);
+    REQUIRE(AWAIT(ra_gate_entered==3,WAIT_MS));
+    pthread_mutex_lock(&g_mu); ra_gate_release=1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    REQUIRE(AWAIT(wgate_entered==1,WAIT_MS));
+    REQUIRE(atomic_load(&worker_space_waits)==0);
+    struct op *miss=reader(8,0,BS,0,0); miss->watched=1; start(miss);
+    REQUIRE(AWAIT(miss->w.last==&P->space_avail,WAIT_MS));
+    wgate_release(); finish(miss); REQUIRE(got(miss)==18);
+    REQUIRE(block_cache_remote_drain(cache,5000)==0 && GET(bwrites[0])==1);
+    close_cache(); free(miss);
+}
+
+static void de_metrics(uint64_t selected, uint64_t uploaded, uint64_t rewritten, uint64_t clean) {
+#ifdef ML_HAS_DIRTY_EVICTION_STATS
+    struct block_cache_stats st; block_cache_get_stats(cache, &st);
+    printf("policy-stats: selected=%ju uploaded=%ju rewrite=%ju clean=%ju\n",
+      (uintmax_t)st.dirty_eviction_selected, (uintmax_t)st.dirty_eviction_uploaded,
+      (uintmax_t)st.dirty_eviction_rewrite_canceled, (uintmax_t)st.dirty_eviction_clean);
+    REQUIRE(st.dirty_eviction_selected==selected && st.dirty_eviction_uploaded==uploaded);
+    REQUIRE(st.dirty_eviction_rewrite_canceled==rewritten && st.dirty_eviction_clean==clean);
+#else
+    (void)selected; (void)uploaded; (void)rewritten; (void)clean;
+    REQUIRE(0 && "policy counters absent");
+#endif
+}
+static void case_de_metrics(void) {
+    de_open(4, 120000); de_fill_four(); de_metrics(0,0,0,0);
+    REQUIRE(read_sync(4, 0, BS)==14); de_metrics(1,1,0,1);
+    block_cache_clear_stats(cache); de_metrics(0,0,0,0);
+    // An upload failure is selected but cannot be counted as successfully reclaimed.
+    de_tick(1); write_sync(1,501); de_tick(120000);
+    REQUIRE(read_sync(2,0,BS)==12 && read_sync(3,0,BS)==13 && read_sync(4,0,BS)==14);
+    atomic_store(&backend_fail,1); REQUIRE(read_sync(5,0,BS)==15);
+    de_metrics(1,0,0,1); atomic_store(&backend_fail,0);
+}
+static void case_de_metrics_off(void) {
+    de_open(4,0); de_fill_four(); REQUIRE(read_sync(4,0,BS)==14);
+    REQUIRE(GET(bwrites[0])==0 && state_of(0)==DIRTY); de_metrics(0,0,0,0);
+}
+static void case_de_metrics_rewrite(void) {
+    case_de_put_rewrite(); de_metrics(1,0,1,2);
+    // The newer generation has its own selection after fresh grace.
+    de_tick(120000); REQUIRE(read_sync(6,0,BS)==16);
+    de_metrics(1,0,1,3); // remote drain already cleaned it; old PUT was never reclamation.
+}

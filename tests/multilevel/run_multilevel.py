@@ -14,7 +14,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 BASE = HERE / 'baseline'
 SOURCES = 'nbdkit block_cache block_part dcache ec_protect zero_cache erase fuse_ops hash util compress http_io reset s3b_config test_io sslcompat gitrev'.split()
-WRAPS = ['fsync', 'fdatasync', 'pread', 'pwrite', 'pthread_cond_wait', 'pthread_cond_timedwait', 'pthread_rwlock_rdlock', 'pthread_rwlock_wrlock']
+WRAPS = ['s3b_hash_get', 'fsync', 'fdatasync', 'pread', 'pwrite', 'pthread_cond_wait', 'pthread_cond_timedwait', 'pthread_rwlock_rdlock', 'pthread_rwlock_wrlock']
 ML_CASES = ['ml-writer-observation-gap', 'ml-dirty-read-same', 'ml-dirty-read-diff', 'ml-write-overlap-dirty', 'ml-write-overlap-clean', 'ml-same-block-excl', 'ml-reader-vs-write',
             'ml-writer-progress', 'ml-snapshot', 'ml-flush-pending-write', 'ml-shutdown-pending-write', 'ml-upload-rewrite', 'ml-singleflight',
             'ml-fill-error', 'ml-readahead', 'ml-evict-gate', 'ml-full-dirty', 'ml-clean2-shared', 'ml-pwrite-error', 'ml-snapshot-error', 'ml-restart',
@@ -91,6 +91,7 @@ def main():
         if not ndebug: flags += ['-DML_EXPECT_ASSERTIONS']
         if 'local_flush' in (src / 'block_cache.h').read_text(): flags += ['-DML_HAS_LOCAL_FLUSH']
         if 'dirty_eviction_grace' in (src / 'block_cache.h').read_text(): flags += ['-DML_HAS_DIRTY_EVICTION']
+        if 'dirty_eviction_selected' in (src / 'block_cache.h').read_text(): flags += ['-DML_HAS_DIRTY_EVICTION_STATS']
         libs = [f'-L{lib}', f'-Wl,-rpath,{lib}', '-lfuse3', '-lexpat', '-lcrypto', '-lcurl', '-lz']
         W = lambda *ws: [f'-Wl,--wrap={w}' for w in ws]
         COND = ['pthread_cond_wait', 'pthread_cond_timedwait']
@@ -133,7 +134,7 @@ def main():
             if only and case not in only: return
             jobs.append((b / binary, case, label, use_disk))
         if 'dirty' in suites:
-            for c in ['de-hog', 'de-default', 'de-shared', 'de-rewrite', 'de-read-recency', 'de-idle', 'de-young', 'de-put-rewrite', 'de-upload-error', 'de-busy-dirty', 'de-busy-clean', 'de-config', 'de-crash', 'de-stress', 'de-boundary', 'de-restart-grace', 'de-snapshot-error', 'de-drain-selected', 'de-reordered-error', 'de-put-shutdown']:
+            for c in ['de-ra-one', 'de-ra-all', 'de-metrics', 'de-metrics-off', 'de-metrics-rewrite', 'de-hog', 'de-default', 'de-shared', 'de-rewrite', 'de-read-recency', 'de-idle', 'de-young', 'de-put-rewrite', 'de-upload-error', 'de-busy-dirty', 'de-busy-clean', 'de-config', 'de-crash', 'de-stress', 'de-boundary', 'de-restart-grace', 'de-snapshot-error', 'de-drain-selected', 'de-reordered-error', 'de-put-shutdown']:
                 add('ml-test', c, f'dirty/disk-rd0/{c}', True)
                 add('ml-test-rd1', c, f'dirty/disk-rd1/{c}', True)
         if 'local' in suites:

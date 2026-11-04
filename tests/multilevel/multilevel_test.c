@@ -52,7 +52,7 @@ static __thread struct gate *tl_gate;
 static __thread struct watch *tl_watch;
 static __thread int tl_sync_allowed;
 static __thread int tl_test;                    // created by this test, not a cache worker
-static atomic_uint worker_waits;
+static atomic_uint worker_waits, worker_space_waits;
 static int disk;
 static int local_mode;
 static u_int de_grace;
@@ -96,6 +96,7 @@ static int mixed_active;
 static unsigned char mixed_expected[BS];
 static atomic_uint direct_calls;
 static int wgate_block = -1, wgate_entered, wgate_permit;
+static int ra_gate_hold, ra_gate_entered, ra_gate_release; // park all workers at a speculative miss
 static int rgate_block = -1, rgate_entered, rgate_permit, rgate_fail;   // backend read gate: call k proceeds when rgate_permit >= k; call 1 fails if rgate_fail
 
 // Payload
@@ -212,10 +213,29 @@ int __wrap_pthread_rwlock_wrlock(pthread_rwlock_t *l) {
 static void observe(pthread_cond_t *c, pthread_mutex_t *m) {
     if (m == &g_mu) return;
     if (tl_watch) { pthread_mutex_lock(&g_mu); tl_watch->waits++; tl_watch->last = c; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu); }
-    else if (!tl_test) atomic_fetch_add(&worker_waits, 1);
+    else if (!tl_test) {
+        atomic_fetch_add(&worker_waits, 1);
+        if (P && c == &P->space_avail) atomic_fetch_add(&worker_space_waits, 1);
+    }
 }
 int __wrap_pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) { observe(c, m); return __real_pthread_cond_wait(c, m); }
 int __wrap_pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *t) { observe(c, m); return __real_pthread_cond_timedwait(c, m, t); }
+
+// Gate the existing outer read-ahead lookup, before do_read takes its allocation path.
+// Releasing the cache mutex lets every worker reach the same scheduling point.
+extern void *__real_s3b_hash_get(struct s3b_hash *, s3b_block_t);
+void *__wrap_s3b_hash_get(struct s3b_hash *h, s3b_block_t b) {
+    if (!tl_test && ra_gate_hold && b>=4 && b<=6 && !__real_s3b_hash_get(h,b)) {
+        pthread_mutex_lock(&g_mu);
+        if (!ra_gate_release) {
+            ra_gate_entered++; pthread_cond_broadcast(&g_cv);
+            pthread_mutex_unlock(&P->mutex);
+            while (!ra_gate_release) pthread_cond_wait(&g_cv,&g_mu);
+            pthread_mutex_unlock(&g_mu); pthread_mutex_lock(&P->mutex);
+        } else pthread_mutex_unlock(&g_mu);
+    }
+    return __real_s3b_hash_get(h,b);
+}
 
 // Fake backend: counts downloads separately from ETag verifications.
 static void logger(int level, const char *fmt, ...) { (void)level; (void)fmt; }
@@ -1407,6 +1427,9 @@ static void case_lf_alloc_terminal(void) {
 
 int main(int argc, char **argv) {
     static const struct { const char *name; void (*fn)(void); } cases[] = {
+        { "de-metrics", case_de_metrics }, { "de-metrics-off", case_de_metrics_off },
+        { "de-metrics-rewrite", case_de_metrics_rewrite },
+        { "de-ra-one", case_de_ra_one }, { "de-ra-all", case_de_ra_all },
         { "de-put-shutdown", case_de_put_shutdown },
         { "de-reordered-error", case_de_reordered_error },
         { "de-drain-selected", case_de_drain_selected },
