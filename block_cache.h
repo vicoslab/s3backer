@@ -48,6 +48,7 @@ struct block_cache_conf {
     u_int               no_verify;
     u_int               fadvise;
     u_int               local_flush;        // FLUSH/FUA acknowledge the persistent local cache
+    u_int               dirty_eviction_grace; // milliseconds since last write; zero disables age eviction
     u_int               read_direct;        // O_DIRECT reads for pinned CLEAN cache file hits
     u_int               recover_dirty_blocks;
     u_int               perform_flush;

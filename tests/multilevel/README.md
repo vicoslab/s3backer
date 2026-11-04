@@ -29,3 +29,24 @@ with known dirty rewrite/partial patterns, invalid identity byte-prefix images,
 and marker-before-erase ordering. Absent features fail assertions (never skip).
 Run with `--variants cand-assert,cand-asan,cand-tsan,cand-opt --suites local`.
 TSan receives exactly one attempt; environment startup failures remain failures.
+
+The `dirty` suite includes `dirty_eviction_test.c` in the same real-source harness.
+It injects a deterministic CLOCK_MONOTONIC clock only for the grace policy (the
+existing realtime worker/barrier clock is unchanged), and runs buffered/direct
+FILE variants. `de-hog` fills 80% DIRTY / 20% CLEAN, reads a 35% working set, and
+requires 7/7 second-pass hits. On b33f81c it fails behaviorally at 0/7;
+`de-default` requires the original 0/7 with grace disabled. Other cases cover
+shared recency, rewrite grace, read recency without grace reset, exact boundaries
+beyond 32-bit time, idle zero PUTs, young-dirty pressure progress, two allocators
+waiting during a victim PUT and rewrite, upload/snapshot errors, busy references,
+invalid configurations, SIGKILL/LOCAL_ACK recovery with a fresh grace interval,
+drain/shutdown and concurrent stress. Gated read-ahead/drain tests cover a later
+drain retaining its upload request and a barrier reordering a selected victim
+behind a different failed block. Run with `--suites dirty,local,ml,flush,order,direct,pins`.
+
+The harness uses `<config.h>` so the runner's generated header wins over the
+checked-in header. Assertion variants define `ML_EXPECT_ASSERTIONS` and fail to
+compile if NDEBUG is active; `TEST-START` also prints `assertions=on/off`. This
+keeps the included production cache invariant checks active in assertion and
+sanitizer builds. Each test runs under its build directory, compiler scratch uses
+`--out/tmp`, and receipts record the per-case command, working directory and environment.

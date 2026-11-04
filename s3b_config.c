@@ -373,6 +373,10 @@ static const struct fuse_opt option_list[] = {
         .value=     1
     },
     {
+        .templ=     "--blockCacheDirtyEvictionGrace=%u",
+        .offset=    offsetof(struct s3b_config, block_cache.dirty_eviction_grace),
+    },
+    {
         .templ=     "--blockCacheLocalFlush",
         .offset=    offsetof(struct s3b_config, block_cache.local_flush),
         .value=     1
@@ -773,6 +777,7 @@ s3backer_get_config2(int argc, char **argv, int nbd, int parse_only, fuse_opt_pr
             "blockCacheNoVerify",
             "blockCacheFileAdvise",
             "blockCacheLocalFlush",
+            "blockCacheDirtyEvictionGrace",
             "blockCacheReadDirect",
             "minWriteDelay",
             "md5CacheSize",
@@ -1773,6 +1778,11 @@ validate_config(int parse_only)
         warnx("--blockCacheLocalFlush requires persistent FILE cache, recovery and verification; conflicts with sync, force, reset and shared mode");
         return -1;
     }
+    if (config.block_cache.dirty_eviction_grace && (!config.block_cache.local_flush
+      || !config.block_cache.cache_file || !config.block_cache.cache_size || config.block_cache.num_protected)) {
+        warnx("--blockCacheDirtyEvictionGrace requires FILE local FLUSH and blockCacheNumProtected=0");
+        return -1;
+    }
     // Check block cache config
     if (config.block_cache.cache_size > 0 && config.block_cache.num_threads <= 0) {
         warnx("invalid block cache thread pool size %u", config.block_cache.num_threads);
@@ -2249,6 +2259,7 @@ usage(void)
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheNoVerify", "Disable verification of data loaded from cache file");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheFileAdvise", "Use posix_fadvise(2) after reading from cache file");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheLocalFlush", "Acknowledge FLUSH/FUA in persistent local cache (default off)");
+    fprintf(stderr, "\t--%-27s %s\n", "blockCacheDirtyEvictionGrace=MILLIS", "Pressure LRU includes old DIRTY blocks; FILE local FLUSH, protected=0 (default 0/off)");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheReadDirect", "Use O_DIRECT for pinned clean cache file hits");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheSize=NUM", "Block cache size (in number of blocks)");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheSync", "Block cache performs all writes synchronously");

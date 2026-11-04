@@ -6,14 +6,34 @@
  * synchronize; sleeps only let clean timeouts expire and bound negative observations.
  * Payload words encode (block, generation, word index), so torn, stale or backend data
  * is detected. Build with -DREAD_PINS_CANDIDATE to also check candidate-only state. */
-#include "config.h"
+#include <config.h> // use the runner's generated configuration, ahead of the checked-in NDEBUG header
 #include <string.h>
 #include <stdatomic.h>
+#include <stdint.h>
+#include <time.h>
 #include <sys/wait.h>
+static atomic_uint_fast64_t de_clock_offset;
+static atomic_int de_clock_active;
+static int de_clock_gettime(clockid_t id, struct timespec *t) {
+    int r = clock_gettime(id, t);
+    if (!r && id == CLOCK_MONOTONIC && atomic_load(&de_clock_active)) {
+        t->tv_sec = 1000; t->tv_nsec = 0;
+        uint64_t ms = atomic_load(&de_clock_offset);
+        t->tv_sec += ms / 1000; t->tv_nsec += (ms % 1000) * 1000000;
+        if (t->tv_nsec >= 1000000000) { t->tv_sec++; t->tv_nsec -= 1000000000; }
+    }
+    return r;
+}
+#define clock_gettime de_clock_gettime
 void *test_memcpy(void *dst, const void *src, size_t n);
 #define memcpy test_memcpy
 #include "block_cache.c"
 #undef memcpy
+#undef clock_gettime
+
+#if defined(ML_EXPECT_ASSERTIONS) && defined(NDEBUG)
+#error "The real-source cache harness must have production invariant assertions enabled"
+#endif
 
 #define REQUIRE(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
 #define BS 4096
@@ -35,6 +55,7 @@ static __thread int tl_test;                    // created by this test, not a c
 static atomic_uint worker_waits;
 static int disk;
 static int local_mode;
+static u_int de_grace;
 static u_int local_max_dirty;
 static int local_threads = 2;
 static atomic_int remote_read_fail;
@@ -46,6 +67,7 @@ static atomic_int sync_fail;
 static atomic_uint sync_calls;
 static atomic_int erase_observer, synced_marker;
 static atomic_int fsync_fail, metadata_fail, backend_fail;
+static atomic_int backend_fail_block = -1;
 static atomic_long fail_pwrite_offset = -1;
 extern int __real_fsync(int);
 int __wrap_fsync(int fd) {
@@ -220,7 +242,7 @@ static int be_read(struct s3backer_store *s, s3b_block_t b, void *dst, u_char *t
 }
 static int be_write(struct s3backer_store *s, s3b_block_t b, const void *src, u_char *tag, check_cancel_t *cancel, void *arg) {
     (void)s; (void)cancel; (void)arg;
-    if (atomic_load(&backend_fail)) return EIO;
+    if (atomic_load(&backend_fail) || (int)b == atomic_load(&backend_fail_block)) return EIO;
     int gen = src != NULL ? decode(src, b, 0, BS) : -1;
     pthread_mutex_lock(&g_mu);
     if (mixed_active && b == 0) { REQUIRE(src && memcmp(src, mixed_expected, BS) == 0); gen = 900; }
@@ -243,6 +265,9 @@ static void open_cache2(u_int size, u_int timeout_ms, u_int protect, u_int delay
     cc.write_delay = delay; cc.read_ahead = ra; cc.read_ahead_trigger = ra ? 2 : 0;
     #ifdef ML_HAS_LOCAL_FLUSH
     cc.local_flush = local_mode;
+#ifdef ML_HAS_DIRTY_EVICTION
+    cc.dirty_eviction_grace = de_grace;
+#endif
 #endif
     cc.log = logger; cc.cache_file = getenv("S3BACKER_TEST_CACHE"); cc.perform_flush = 1; cc.recover_dirty_blocks = 1;
     disk = cc.cache_file != NULL;
@@ -1378,8 +1403,19 @@ static void case_lf_alloc_terminal(void) {
     REQUIRE(s3b_dcache_size(P->dcache)==2 && !has_block(3)); REQUIRE(cache->flush_blocks(cache,NULL,0,0)==ENOMEM);
     REQUIRE(cache->shutdown(cache)==ENOMEM); cache->destroy(cache); cache=NULL; free(r);
 }
+#include "dirty_eviction_test.c"
+
 int main(int argc, char **argv) {
     static const struct { const char *name; void (*fn)(void); } cases[] = {
+        { "de-put-shutdown", case_de_put_shutdown },
+        { "de-reordered-error", case_de_reordered_error },
+        { "de-drain-selected", case_de_drain_selected },
+        { "de-boundary", case_de_boundary }, { "de-restart-grace", case_de_restart_grace }, { "de-snapshot-error", case_de_snapshot_error },
+        { "de-shared", case_de_shared }, { "de-rewrite", case_de_rewrite }, { "de-read-recency", case_de_read_recency },
+        { "de-idle", case_de_idle }, { "de-young", case_de_young }, { "de-put-rewrite", case_de_put_rewrite },
+        { "de-upload-error", case_de_upload_error }, { "de-busy-dirty", case_de_busy_dirty }, { "de-busy-clean", case_de_busy_clean },
+        { "de-config", case_de_config }, { "de-crash", case_de_crash }, { "de-stress", case_de_stress },
+        { "de-hog", case_de_hog }, { "de-default", case_de_default },
         { "lf-read-verify-tears", case_lf_read_verify_tears }, { "lf-read-refill-tears", case_lf_read_refill_tears },
         { "lf-alloc-terminal", case_lf_alloc_terminal },
         { "lf-read-fill-tears", case_lf_read_fill_tears }, { "lf-remote-read-errors", case_lf_remote_read_errors },
@@ -1413,7 +1449,13 @@ int main(int argc, char **argv) {
         { "ml-read-owner", case_ml_read_owner }, { "ml-after-shutdown", case_ml_after_shutdown }, { "ml-dcache-extend", case_ml_dcache_extend }, { "ml-slot-reuse", case_ml_slot_reuse },
     };
     REQUIRE(argc == 2); tl_test = 1;
-    fprintf(stderr, "TEST-START %s\n", argv[1]);                               // lets the runner tell pre-main startup failures from test crashes
+    fprintf(stderr, "TEST-START %s assertions=%s\n", argv[1],
+#ifdef NDEBUG
+      "off"
+#else
+      "on"
+#endif
+    ); // lets the runner tell pre-main startup failures from test crashes and verify assertion mode
     signal(SIGALRM, watchdog); alarm(60);
     for (int b = 0; b < NB; b++) bgen[b] = 10 + b;
     for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); i++) {

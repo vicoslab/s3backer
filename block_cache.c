@@ -79,8 +79,9 @@
  *
  * Blocks in the READING/READING2 and WRITING/WRITING2 states are not in either list.
  *
- * Only CLEAN and CLEAN2 blocks are eligible to be evicted from the cache. We evict entries
- * either when they timeout or the cache is full and we need to add a new entry to it.
+ * Only CLEAN and CLEAN2 blocks can be discarded directly, on timeout or for space.
+ * With dirty_eviction_grace, idle age-eligible DIRTY blocks also compete by shared
+ * access recency under space pressure; the existing workers must upload them first.
  *
  * Two-level locking
  * -----------------
@@ -161,6 +162,9 @@
 struct cache_entry {
     s3b_block_t                     block_num;      // block number - MUST BE FIRST
     int                             write_error;    // last failed writeback, cleared on success
+    uint64_t                        last_write_millis; // monotonic, RAM only; grace restarts on recovery
+    uint64_t                        last_access;    // shared CLEAN/DIRTY recency sequence, mutex protected
+    u_int                           eviction_upload; // pressure request owned by the worker, never an allocator pointer
     u_int                           dirty:1;        // indicates state DIRTY or WRITING2
     u_int                           verify:1;       // data should be verified first
     uint32_t                        timeout:30;     // when to evict (CLEAN[2]) or write (DIRTY)
@@ -209,6 +213,8 @@ struct block_cache_flush_waiter {
 
 // Private data
 struct block_cache_private {
+    uint64_t                        access_sequence;
+    u_int                           eviction_pending; // one age-selected upload; allocators rescan after wakeup
     struct block_cache_conf         *config;        // configuration
     struct s3backer_store           *inner;         // underlying s3backer store
     struct block_cache_stats        stats;          // statistics
@@ -300,6 +306,9 @@ static struct list_head *block_cache_cleans_list(struct block_cache_private *pri
 static int block_cache_high_prio(struct block_cache_conf *conf, s3b_block_t block_num);
 static uint32_t block_cache_get_time(struct block_cache_private *priv);
 static uint64_t block_cache_get_time_millis(void);
+static uint64_t block_cache_monotonic_millis(void);
+static struct cache_entry *block_cache_eviction_candidate(struct block_cache_private *priv);
+static void block_cache_eviction_done(struct block_cache_private *priv, struct cache_entry *entry);
 static int block_cache_read_data(struct block_cache_private *priv, struct cache_entry *entry, void *dest, u_int off, u_int len);
 static struct cache_entry *block_cache_first_idle(struct list_head *list);
 static int block_cache_write_data(struct block_cache_private *priv, struct cache_entry *entry, const void *src, u_int off,
@@ -360,6 +369,8 @@ block_cache_create(struct block_cache_conf *config, struct s3backer_store *inner
 
     if (config->local_flush && (!config->cache_file || !config->recover_dirty_blocks
       || config->no_verify || config->synchronous)) { errno = EINVAL; return NULL; }
+    if (config->dirty_eviction_grace && (!config->local_flush || !config->cache_file
+      || !config->cache_size || config->num_protected)) { errno = EINVAL; return NULL; }
     // Direct reads only apply to a cache file
     if (config->read_direct && config->cache_file == NULL) {
         (*config->log)(LOG_ERR, "direct cache reads require a cache file");
@@ -523,6 +534,10 @@ block_cache_dcache_load(void *arg, s3b_block_t dslot, s3b_block_t block_num, con
     }
     entry->block_num = block_num;
     entry->timeout = dirty && config->local_flush ? READING_TIMEOUT : block_cache_get_time(priv) + priv->clean_timeout;
+    if (config->dirty_eviction_grace) {
+        entry->last_write_millis = block_cache_monotonic_millis();
+        entry->last_access = ++priv->access_sequence;
+    }
     entry->u.dslot = dslot;
 
     // Mark as clean or dirty accordingly
@@ -1206,6 +1221,8 @@ again:
         case DIRTY:
         case WRITING:
         case WRITING2:
+            if (config->dirty_eviction_grace)
+                entry->last_access = ++priv->access_sequence;
             if (len == 0) {
                 r = 0;
                 break;
@@ -1344,6 +1361,8 @@ read:
     }
 
     // Change entry from READING[2] to CLEAN
+    if (config->dirty_eviction_grace)
+        entry->last_access = ++priv->access_sequence;
     entry->verify = 0;
     entry->timeout = block_cache_get_time(priv) + priv->clean_timeout;
     TAILQ_INSERT_TAIL(cleans_list, entry, link);
@@ -1547,8 +1566,17 @@ again:
             if ((r = block_cache_write_data(priv, entry, src, off, len)) != 0)
                 (*config->log)(LOG_ERR, "error updating dirty block: %s", strerror(r));
         }
-        pthread_rwlock_unlock(&entry->lock);
+        if (!config->dirty_eviction_grace)
+            pthread_rwlock_unlock(&entry->lock);
         pthread_mutex_lock(&priv->mutex);
+        if (config->dirty_eviction_grace) {
+            // Publish the successful write time before any later writer or uploader can acquire the entry lock.
+            if (!r) {
+                entry->last_write_millis = block_cache_monotonic_millis();
+                entry->last_access = ++priv->access_sequence;
+            }
+            pthread_rwlock_unlock(&entry->lock);
+        }
         S3BCACHE_CHECK_INVARIANTS(priv, 1);
         block_cache_entry_unref(priv, entry, 0);
         if (r && config->local_flush) goto fail;
@@ -1634,6 +1662,10 @@ again:
         goto fail;
     }
     // Change the new entry from READING to DIRTY
+    if (config->dirty_eviction_grace) {
+        entry->last_write_millis = block_cache_monotonic_millis();
+        entry->last_access = ++priv->access_sequence;
+    }
     entry->timeout = config->local_flush ? READING_TIMEOUT : block_cache_get_time(priv) + priv->dirty_timeout;
     entry->dirty = 1;
     TAILQ_INSERT_TAIL(&priv->dirties, entry, link);
@@ -1709,7 +1741,9 @@ block_cache_write_failed(struct block_cache_private *priv, struct cache_entry *e
 
 /*
  * Acquire a new cache entry. If the cache is full, and there is at least one
- * idle CLEAN[2] entry, evict it. Otherwise, return NULL entry.
+ * idle CLEAN[2] entry, evict it. Opt-in age selection can instead request a DIRTY
+ * upload and return RETRY after waiting, without retaining a victim pointer.
+ * Otherwise, return NULL entry for the existing pressure fallback.
  *
  * On successful return, *datap will point to a malloc'd buffer for the data. If using
  * the disk cache, this will be a temporary buffer, otherwise it's the in-memory buffer.
@@ -1745,14 +1779,34 @@ again:
             priv->stats.out_of_memory_errors++;
             return r;
         }
-    } else if ((entry = block_cache_first_idle(&priv->lo_cleans)) != NULL
-      || (entry = block_cache_first_idle(&priv->hi_cleans)) != NULL) {
+    } else {
+        if (config->dirty_eviction_grace) {
+            // No entry pointer survives a wait. The worker owns the DIRTY/WRITING lifetime;
+            // after every wake the caller restarts its hash lookup and candidate selection.
+            if (priv->eviction_pending) {
+                pthread_cond_wait(&priv->space_avail, &priv->mutex);
+                return BLOCK_CACHE_RETRY;
+            }
+            entry = block_cache_eviction_candidate(priv);
+            if (entry && ENTRY_GET_STATE(entry) == DIRTY) {
+                entry->eviction_upload = 1;
+                priv->eviction_pending = 1;
+                TAILQ_REMOVE(&priv->dirties, entry, link);
+                TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
+                entry->timeout = block_cache_get_time(priv); // existing pressure wakeup, never an age timer
+                pthread_cond_signal(&priv->worker_work);
+                pthread_cond_wait(&priv->space_avail, &priv->mutex);
+                return BLOCK_CACHE_RETRY;
+            }
+        } else if ((entry = block_cache_first_idle(&priv->lo_cleans)) == NULL)
+            entry = block_cache_first_idle(&priv->hi_cleans);
+        if (!entry)
+            goto done;
         block_cache_free_entry(priv, entry);
         if (config->cache_file != NULL)
             return BLOCK_CACHE_RETRY;
         goto again;
-    } else
-        goto done;
+    }
 
     // Get associated data buffer
     if (datap != NULL || config->cache_file == NULL) {
@@ -1784,6 +1838,43 @@ done:
     if (datap != NULL)
         *datap = data;
     return 0;
+}
+
+/*
+ * Pressure-only shared LRU. Protected slots are rejected at configuration time.
+ * Scan the existing lists: no additional list, lock or persistent metadata. Busy
+ * entries and previous upload errors are skipped; the original all-dirty space
+ * fallback still forces progress even when every dirty block is younger than grace.
+ * All fields and returned pointers are used only under the housekeeping mutex.
+ */
+static struct cache_entry *
+block_cache_eviction_candidate(struct block_cache_private *priv)
+{
+    struct cache_entry *entry, *best = NULL;
+    const uint64_t now = block_cache_monotonic_millis();
+
+    TAILQ_FOREACH(entry, &priv->lo_cleans, link) {
+        if (!ENTRY_BUSY(entry) && (!best || entry->last_access < best->last_access))
+            best = entry;
+    }
+    TAILQ_FOREACH(entry, &priv->dirties, link) {
+        if (!ENTRY_BUSY(entry) && !entry->write_error && now >= entry->last_write_millis
+          && now - entry->last_write_millis >= priv->config->dirty_eviction_grace
+          && (!best || entry->last_access < best->last_access))
+            best = entry;
+    }
+    return best;
+}
+
+static void
+block_cache_eviction_done(struct block_cache_private *priv, struct cache_entry *entry)
+{
+    if (entry->eviction_upload) {
+        assert(priv->eviction_pending == 1);
+        entry->eviction_upload = 0;
+        priv->eviction_pending = 0;
+        pthread_cond_broadcast(&priv->space_avail);
+    }
 }
 
 /*
@@ -1896,8 +1987,26 @@ block_cache_worker_main(void *arg)
         // As we approach our maximum dirty block limit, force earlier than planned writes
         adjusted_now = now + (uint32_t)(priv->dirty_timeout * (block_cache_dirty_ratio(priv) / priv->max_dirty_ratio));
 
+        // A read or successful rewrite between selection and worker admission can change the victim.
+        // Cancel before taking a snapshot; once WRITING, the existing rewrite protocol owns it.
+        entry = TAILQ_FIRST(&priv->dirties);
+        if (priv->eviction_pending) {
+            struct cache_entry *selected;
+
+            // A barrier can reorder the queue. Do not strand the selected request behind a failed head.
+            TAILQ_FOREACH(selected, &priv->dirties, link) {
+                if (selected->eviction_upload) { entry = selected; break; }
+            }
+        }
+        if (entry && entry->eviction_upload && !priv->draining && !priv->stopping
+          && priv->flush_waiters == NULL && block_cache_eviction_candidate(priv) != entry) {
+            entry->timeout = READING_TIMEOUT;
+            block_cache_eviction_done(priv, entry);
+            continue;
+        }
+
         // See if there is a block that needs writing
-        if ((entry = TAILQ_FIRST(&priv->dirties)) != NULL && (!config->local_flush ? (priv->stopping || priv->draining || adjusted_now >= entry->timeout)
+        if (entry != NULL && (!config->local_flush ? (priv->stopping || priv->draining || adjusted_now >= entry->timeout)
           : (!s3b_dcache_error(priv->dcache) && !priv->shutdown_error && (priv->stopping || priv->draining
             || entry->timeout != READING_TIMEOUT || block_cache_dirty_ratio(priv) >= priv->max_dirty_ratio)))) {
 
@@ -1930,6 +2039,7 @@ block_cache_worker_main(void *arg)
                 entry->dirty = 1;
                 TAILQ_INSERT_HEAD(&priv->dirties, entry, link);
                 block_cache_write_failed(priv, entry, r);
+                block_cache_eviction_done(priv, entry);
                 pthread_cond_broadcast(&priv->space_avail);
                 entry->timeout = config->local_flush ? READING_TIMEOUT : block_cache_get_time(priv) + (priv->dirty_timeout ? priv->dirty_timeout : 1);
                 pthread_rwlock_unlock(&entry->lock);
@@ -1968,6 +2078,7 @@ block_cache_worker_main(void *arg)
                     block_cache_write_failed(priv, entry, r);
                     if (config->local_flush && priv->draining) priv->shutdown_error = r;
                 }
+                block_cache_eviction_done(priv, entry);
                 pthread_cond_broadcast(&priv->write_complete);
                 continue;
             }
@@ -1997,6 +2108,7 @@ block_cache_worker_main(void *arg)
             }
 
             // If block was not modified while being written (WRITING), it is now CLEAN
+            block_cache_eviction_done(priv, entry);
             if (!entry->dirty) {
                 priv->num_dirties--;
                 cleans_list = block_cache_cleans_list(priv, entry->block_num);
@@ -2172,9 +2284,17 @@ block_cache_high_prio(struct block_cache_conf *const config, s3b_block_t block_n
     return block_num < config->num_protected;
 }
 
-/*
- * Return current time in milliseconds.
- */
+// Grace clock only; independent of the existing realtime timeout/barrier clock.
+static uint64_t
+block_cache_monotonic_millis(void)
+{
+    struct timespec ts;
+
+    CHECK_RETURN(clock_gettime(CLOCK_MONOTONIC, &ts));
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+// Existing realtime clock for worker waits and barriers (unchanged).
 static uint64_t
 block_cache_get_time_millis(void)
 {

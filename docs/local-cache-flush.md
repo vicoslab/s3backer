@@ -19,6 +19,28 @@ writes while prior admitted mutations finish and the cache syncs; reads continue
 It holds no cache housekeeping mutex over sync. FUA currently uses the same full
 local barrier as FLUSH, which also covers its requested range.
 
+`--blockCacheDirtyEvictionGrace=120000` optionally allows blocks last written at
+least 120000 **milliseconds** ago to compete with CLEAN blocks for space. The
+default is `0` (off), preserving the existing CLEAN-only eviction policy. This
+requires FILE local FLUSH mode and `--blockCacheNumProtected=0`; protected slots
+are rejected with this option. No data PUT is triggered just because grace expires.
+
+At full capacity, the least recently accessed idle CLEAN or eligible DIRTY block
+wins. Reads refresh recency but do not restart write grace; each successful write
+does both. Thus old DIRTY data cannot indefinitely crowd out a larger fresh read
+set. A selected DIRTY block goes through the existing worker upload path before
+its slot can be reused. Allocators wait without retaining an entry pointer, then
+rescan shared recency. A concurrent rewrite remains DIRTY after an older PUT.
+Upload errors retain the local copy and allow an idle CLEAN fallback; explicit
+drain reports the error and can retry it. Existing all-dirty pressure fallback,
+dirty threshold uploads, explicit drain and shutdown still apply regardless of
+grace, so this is not a minimum remote retention guarantee.
+
+Last-write time uses a 64-bit monotonic millisecond clock, separate from a 64-bit
+access-order sequence shared by reads and writes. Both are RAM-only; recovery
+starts a new full grace interval for recovered DIRTY blocks. The cache header,
+LOCAL_ACK marker, local acknowledgment and recovery format are unchanged.
+
 Use the existing stats mirror, for example `--statsFileMirror=/local/cache.stats`.
 Request a bounded remote barrier with:
 

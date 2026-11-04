@@ -60,6 +60,8 @@ def main():
     deps = a.deps; lib = deps / 'lib/x86_64-linux-gnu'
     env = {k: v for k, v in os.environ.items() if k not in ('CPATH', 'C_INCLUDE_PATH', 'LIBRARY_PATH', 'LD_PRELOAD', 'TSAN_OPTIONS', 'ASAN_OPTIONS', 'UBSAN_OPTIONS')}
     env['LD_LIBRARY_PATH'] = str(lib)
+    (out / 'tmp').mkdir()
+    env['TMPDIR'] = str(out / 'tmp')
     NOASLR = ['setarch', os.uname().machine, '-R'] if shutil.which('setarch') and subprocess.run(['setarch', os.uname().machine, '-R', 'true'], capture_output=True).returncode == 0 else []
     t_start = time.time(); suites = a.suites.split(','); only = set(filter(None, a.cases.split(',')))
     rec = {'repo': str(REPO), 'compiler': subprocess.check_output([a.cc, '--version'], text=True).splitlines()[0], 'compiler_sha256': sha(pathlib.Path(a.cc).resolve()),
@@ -86,7 +88,9 @@ def main():
         cflags, lflags, renv = (san if san else ([], [], {}))
         flags = [a.cc, '-std=gnu11', '-O2', '-g', '-march=x86-64', '-mtune=generic', '-fPIC', '-ffunction-sections', '-fdata-sections', '-pthread', *cflags,
                  f'-I{src}', f'-I{HERE}', f'-I{deps}/include', f'-I{deps}/include/x86_64-linux-gnu', f'-I{deps}/include/fuse3'] + (['-DREAD_PINS_CANDIDATE'] + (['-DMULTILEVEL_CANDIDATE'] if cand else []) + (['-DML_HAS_DRAINING'] if 'draining' in (src / 'block_cache.c').read_text() else []))
+        if not ndebug: flags += ['-DML_EXPECT_ASSERTIONS']
         if 'local_flush' in (src / 'block_cache.h').read_text(): flags += ['-DML_HAS_LOCAL_FLUSH']
+        if 'dirty_eviction_grace' in (src / 'block_cache.h').read_text(): flags += ['-DML_HAS_DIRTY_EVICTION']
         libs = [f'-L{lib}', f'-Wl,-rpath,{lib}', '-lfuse3', '-lexpat', '-lcrypto', '-lcurl', '-lz']
         W = lambda *ws: [f'-Wl,--wrap={w}' for w in ws]
         COND = ['pthread_cond_wait', 'pthread_cond_timedwait']
@@ -128,6 +132,10 @@ def main():
         def add(binary, case, label, use_disk):
             if only and case not in only: return
             jobs.append((b / binary, case, label, use_disk))
+        if 'dirty' in suites:
+            for c in ['de-hog', 'de-default', 'de-shared', 'de-rewrite', 'de-read-recency', 'de-idle', 'de-young', 'de-put-rewrite', 'de-upload-error', 'de-busy-dirty', 'de-busy-clean', 'de-config', 'de-crash', 'de-stress', 'de-boundary', 'de-restart-grace', 'de-snapshot-error', 'de-drain-selected', 'de-reordered-error', 'de-put-shutdown']:
+                add('ml-test', c, f'dirty/disk-rd0/{c}', True)
+                add('ml-test-rd1', c, f'dirty/disk-rd1/{c}', True)
         if 'local' in suites:
             for c in ['lf-read-verify-tears', 'lf-read-refill-tears', 'lf-alloc-terminal', 'lf-read-fill-tears', 'lf-remote-read-errors', 'lf-shutdown-snapshot-error', 'lf-shutdown-snapshot-short', 'lf-poison-during-sync', 'lf-poison-space-waiter', 'lf-local', 'lf-default', 'lf-sync-error', 'lf-pwrite-error', 'lf-drain', 'lf-pending', 'lf-signal', 'lf-drain-error', 'lf-shutdown-error', 'lf-pressure', 'lf-metadata-error', 'lf-create-error', 'lf-invalid', 'lf-crash', 'lf-identity-tears', 'lf-marker-error', 'lf-header-error', 'lf-clean2-write', 'lf-sync-concurrent', 'lf-reopen-gates', 'lf-erase-order', 'lf-generation', 'lf-shutdown-pending', 'lf-stress', 'lf-read-miss-error', 'lf-erase-error', 'lf-clean-migration', 'lf-maxdirty', 'lf-slot-reuse', 'lf-helper']:
                 add('ml-test', c, f'local/disk/{c}', True)
@@ -163,7 +171,8 @@ def main():
                     cache = b / (label.replace('/', '_') + f'.{attempts}.cache'); cache.unlink(missing_ok=True); tenv['S3BACKER_TEST_CACHE'] = str(cache)
                 try:
                     nor = NOASLR if 'TSAN_OPTIONS' in renv else []   # TSAN may need ASLR off on newer kernels (only if the sandbox permits it)
-                    r = subprocess.run(['timeout', '-k', '5', str(a.case_timeout), *nor, str(binary), case], env=tenv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    command = ['timeout', '-k', '5', str(a.case_timeout), *nor, str(binary), case]
+                    r = subprocess.run(command, env=tenv, cwd=b, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                     code, text = r.returncode, r.stdout
                 except Exception as e: code, text = -1, repr(e)
                 if cache: cache.unlink(missing_ok=True)
@@ -184,7 +193,8 @@ def main():
                 bases.append(basis)
                 # One attempt: retain actual sanitizer environment failures.
                 break
-            return label, {'exit': code, 'attempts': attempts, 'startup_failure': startup, 'startup_attempt_basis': [x for x in bases if x],
+            return label, {'exit': code, 'command': command, 'cwd': str(b), 'environment': {k: tenv[k] for k in ['TMPDIR', 'LD_LIBRARY_PATH', 'S3BACKER_TEST_CACHE', *renv] if k in tenv},
+                           'attempts': attempts, 'startup_failure': startup, 'startup_attempt_basis': [x for x in bases if x],
                            'sanitizer_report': any(m in text for m in ['WARNING: ThreadSanitizer', 'ERROR: AddressSanitizer', 'runtime error:']),
                            'timed_out': code in (124, 137), 'output': text.strip()[-500:]}
         with cf.ThreadPoolExecutor(a.jobs) as ex:
