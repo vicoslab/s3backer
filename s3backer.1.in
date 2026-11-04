@@ -592,6 +592,18 @@ on behalf of the block cache file.
 This flag is ignored if
 .Fl \-blockCacheFile
 is not specified.
+.It Fl \-blockCacheDirtyEvictionGrace=MILLIS
+Include age-eligible dirty blocks in the shared least-recently-accessed space
+selection when the cache is full. Default zero disables this policy.
+For example, 120000 means 120000 milliseconds since the last successful write.
+Requires a persistent FILE cache with
+.Fl \-blockCacheLocalFlush
+and zero protected slots.
+Reads update recency but do not restart grace. Recovery starts a new grace
+interval. Age alone never triggers an upload. A dirty block must be uploaded
+successfully before reuse; concurrent rewrites remain dirty.
+Existing dirty-pressure uploads, explicit drain and shutdown are unchanged.
+See docs/local-cache-flush.md for local durability and recovery requirements.
 .It Fl \-blockHashPrefix
 Prepend random prefixes (generated deterministically from the block number) to block object names.
 This spreads requests more evenly across the namespace, and prevents heavy access to a narrow range of blocks from all being directed to the same backend server.

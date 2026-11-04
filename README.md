@@ -2,6 +2,21 @@
 
 In typical usage, a normal filesystem is mounted on top of the file exported by the **s3backer** filesystem using a loopback mount (or disk image mount on Mac OS X).
 
+### NFS benchmark additions in this fork
+
+This version includes the following changes developed for our cached-storage/NFS benchmark:
+
+* **NBD and FLUSH fixes:** corrected nbdkit block-size negotiation, waiting for in-flight uploads and reporting upload errors during FLUSH/FUA, and dirty-queue ordering so a delayed head does not stall an explicit barrier.
+* **Concurrent cache I/O:** pinned CLEAN reads and stable per-entry reader/writer locks below a short global housekeeping mutex. Reads can share an entry; writes exclude only that entry. Upload snapshots release the entry lock before network I/O, and shutdown closes admission and drains active requests before stopping workers.
+* **Direct cache reads:** optional `--blockCacheReadDirect` uses a separate O_DIRECT descriptor for CLEAN file-cache hits, with aligned reads and a buffered fallback where needed. DIRTY/uploading reads remain buffered.
+* **Persistent local FLUSH:** opt-in `--blockCacheLocalFlush` lets FLUSH/FUA/FUSE fsync acknowledge a synchronized persistent FILE cache without waiting for S3 upload. Dirty recovery and compatibility safeguards protect locally acknowledged data; an explicit remote drain is available through `tools/local-cache-drain.py`. Default FLUSH behavior still waits for the remote backend.
+* **Pressure-driven dirty reclaim:** opt-in `--blockCacheDirtyEvictionGrace=MILLISECONDS` lets old DIRTY blocks compete with CLEAN blocks in shared access order. Selected blocks must upload successfully before reuse; bounded parallel reclaim uses the existing upload-worker pool. Grace expiry alone does not trigger uploads. This requires local FLUSH mode and `--blockCacheNumProtected=0`; the default `0` disables the policy. Statistics expose selection, upload, rewrite-cancellation and CLEAN-eviction counters.
+
+See the [locking contract](docs/locking.md), [local-cache operation/recovery contract](docs/local-cache-flush.md), and [native regression/build instructions](tests/multilevel/README.md). Validation and its limits are recorded for [multilevel locking](docs/multilevel-validation.md), [local FLUSH](docs/local-cache-validation.md), and [dirty eviction](docs/dirty-eviction-validation.md). Normal build instructions remain in [INSTALL](INSTALL).
+
+These additions do **not** make s3backer a distributed filesystem or add simultaneous read/write mounts. Isolated mounted checks and native regressions do not establish NFS-client performance, physical power-loss durability, or production readiness. In local FLUSH mode the cache may hold the **only copy of acknowledged data**: preserve it and follow the recovery/drain contract rather than deleting it or bypassing safeguards.
+
+
 This arrangement has several benefits compared to more complete S3 filesystem implementations:
 
   * By not attempting to implement a complete filesystem, which is a complex undertaking and difficult to get right, **s3backer** can stay very lightweight and simple. Only three HTTP operations are used: GET, PUT, and DELETE.  All of the experience and knowledge about how to properly implement filesystems that already exists can be reused.
